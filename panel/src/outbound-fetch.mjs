@@ -24,7 +24,9 @@ export async function resolveHostViaDoh(host, { fetchImpl = globalThis.fetch, do
     const url = new URL(dohUrl);
     url.searchParams.set('name', name);
     url.searchParams.set('type', type);
-    const response = await fetchImpl(url, { headers: { Accept: 'application/dns-json' }, redirect: 'error' });
+    // workerd fetch rejects redirect:'error' (a Node/undici-only value);
+    // 'manual' + the status!==200 check below preserves the same semantics.
+    const response = await fetchImpl(url, { headers: { Accept: 'application/dns-json' }, redirect: 'manual' });
     if (!response || response.status !== 200) throw new Error('解析 Worker 域名失败');
     const payload = await response.json();
     rows.push(...normalizeResolvedAddresses(payload.Answer || []));
@@ -78,9 +80,23 @@ export async function requestWorkerApiFetch(workerBase, uuid, suffix, method = '
   allowPrivate = false,
   timeoutMs = 10000,
   signal,
+  serviceFetcher,
 } = {}) {
-  if (typeof fetchImpl !== 'function') throw new Error('运行时没有可用的 fetch');
+  if (typeof fetchImpl !== 'function' && !serviceFetcher) throw new Error('运行时没有可用的 fetch');
   const url = new URL(String(workerBase).replace(/\/$/, '') + '/' + uuid + suffix);
+  if (serviceFetcher) {
+    // Service binding: a private, Cloudflare-internal channel to the bound
+    // core Worker. DNS preflight does not apply (no public DNS hop exists to
+    // validate); the binding itself is the trust boundary.
+    const bound = await serviceFetcher.fetch(url, {
+      method,
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0 (compatible; CFnewPanel)' },
+      body,
+      redirect: 'manual',
+      signal: requestSignal(signal, timeoutMs),
+    });
+    return { status: bound.status, body: await readBodyLimited(bound, 2097152) };
+  }
   await resolveAndValidateUrl(url, { allowPrivate, resolveHost, fetchImpl });
   const response = await fetchImpl(url, {
     method,

@@ -57,6 +57,11 @@ multipart 上传面板（`nodejs_compat`、绑定 `SESSION_KV`、变量 `w`=核�
 3. 部署：编辑 `panel/cloudflare/wrangler.toml`——取消 `SESSION_KV` 绑定
    的注释并填入上一步的 namespace id、按需设置 `w`，然后在
    `panel/cloudflare/` 下执行 `npx wrangler deploy`。
+   - **service binding（w 模式必备）**：Worker 无法用 fetch 访问同账户
+     另一个 Worker 的 workers.dev 地址（Cloudflare 返回 error 1042），
+     面板必须经名为 `CORE` 的 service binding 与绑定的核心 Worker 通信
+     （wrangler.toml 里有注释模板）。用 API 上传时在面板 metadata 的
+     bindings 里加 `{"type":"service","name":"CORE","service":"cfusion-core"}`。
    - `w`（vars）：`https://cfusion-core.<子域>.workers.dev`，只填根
      地址，不带 UUID/路径。设置后为私有单机模式：首页返回 `hello`，
      入口为面板域名 + `/<UUID>`。留空则为公共模式（首页填任意

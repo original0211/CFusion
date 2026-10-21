@@ -8,3 +8,12 @@ export function outboundMode() {
 export function cloudflareRuntime() {
   return globalThis.__CFUSION_RUNTIME__ === 'cloudflare' || outboundMode() === 'fetch';
 }
+
+// Cloudflare service binding to the core Worker, injected by cf-entry from
+// env.CORE. Global fetch cannot reach a same-account workers.dev Worker
+// (Cloudflare returns error 1042), so the panel must talk to its bound core
+// through this private channel instead.
+export function coreServiceFetcher() {
+  const fetcher = globalThis.__CFUSION_CORE_FETCHER__;
+  return fetcher && typeof fetcher.fetch === 'function' ? fetcher : null;
+}

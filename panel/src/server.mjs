@@ -13,7 +13,7 @@ import { ADMIN_COOKIE, adminEnabled, checkAdminPassword, clearedCookieHeader, cr
 import { createHash } from 'node:crypto';
 import { buildSubCacheKey, createSubCache } from './subcache.mjs';
 import { fetchPreferredListFetch, probePreferredFetch, requestWorkerApiFetch } from './outbound-fetch.mjs';
-import { outboundMode } from './runtime.mjs';
+import { coreServiceFetcher, outboundMode } from './runtime.mjs';
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const privateTesting = process.env.CFNEW_ALLOW_PRIVATE === 'yes';
@@ -123,7 +123,16 @@ async function requestWorkerApi(workerBase, uuid, suffix, method = 'GET', body =
   // CFusion P4: Cloudflare runtime has no reliable node:http/DNS pinning.
   // The fetch variant resolves and rejects non-public address sets before
   // sending, but cannot pin the validated IP (see outbound-fetch.mjs).
-  if (outboundMode() === 'fetch') return requestWorkerApiFetch(workerBase, uuid, suffix, method, body, { allowPrivate: privateTesting });
+  if (outboundMode() === 'fetch') {
+    // A service binding (env.CORE) is the only reliable way for this panel
+    // Worker to reach its bound core Worker: global fetch to a same-account
+    // workers.dev host fails with Cloudflare error 1042.
+    const fetcher = coreServiceFetcher();
+    if (fetcher && allowedWorker() && workerBase === allowedWorker()) {
+      return requestWorkerApiFetch(workerBase, uuid, suffix, method, body, { allowPrivate: privateTesting, serviceFetcher: fetcher });
+    }
+    return requestWorkerApiFetch(workerBase, uuid, suffix, method, body, { allowPrivate: privateTesting });
+  }
   return requestWorkerApiNode(workerBase, uuid, suffix, method, body);
 }
 

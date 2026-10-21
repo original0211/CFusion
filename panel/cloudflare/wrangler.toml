@@ -13,6 +13,13 @@ workers_dev = true
 # binding = "SESSION_KV"
 # id = "REPLACE_WITH_SESSION_KV_NAMESPACE_ID"
 
+# REQUIRED in w (single-Worker) mode: a Worker cannot fetch another
+# same-account Worker's workers.dev URL (Cloudflare error 1042), so the
+# panel must reach its bound core through a service binding named CORE.
+# [[services]]
+# binding = "CORE"
+# service = "cfusion-core"
+
 [vars]
 # Bind the panel to exactly one core Worker (private single-Worker mode).
 # Leave empty for public mode. Root HTTPS origin only: no UUID/path/query.

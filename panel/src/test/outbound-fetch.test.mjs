@@ -86,3 +86,16 @@ test('探针B：fetch 运行时优选探测明确降级，绝不伪造测速结�
   assert.equal(result.degraded, true);
   assert.match(result.error, /降级为不可用/);
 });
+
+test('service binding 通道：跳过 DNS 预检且完成 /api/config 往返', async (t) => {
+  const { server, base } = await startCoreServer();
+  t.after(() => server.close());
+  const serviceFetcher = { fetch: (url, init) => fetch(url, init) };
+  const options = {
+    serviceFetcher,
+    resolveHost: async () => { throw new Error('service binding 不应走 DNS 预检'); },
+  };
+  const first = await requestWorkerApiFetch(base, uuid, '/api/config', 'GET', undefined, options);
+  assert.equal(first.status, 200);
+  assert.equal(JSON.parse(first.body).yx, '104.16.1.1:443#初始');
+});

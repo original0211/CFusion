@@ -2,7 +2,9 @@ import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
-import { performance } from 'node:perf_hooks';
+// workerd (Cloudflare) has no node:perf_hooks module; the global
+// performance object exists in both Node and workerd, so use it directly.
+const performance = globalThis.performance;
 import { isPublicAddress } from './net-utils.mjs';
 
 export { isPublicAddress };

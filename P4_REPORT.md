@@ -158,3 +158,41 @@ Node 版共用，避免两套口径漂移）：
 路线②在本地 workerd 已完整跑通：面板与核心同为 Worker、session 可
 KV 化、出站 fetch 化且 SSRF 降级明示、优选探测诚实降级。P4 本地部
 分完成；真机部署只剩凭据与执行（DEPLOY-CF 方式一）。
+
+## 八、GitHub
+
+- 2026-10-22 上传完成：仓库 https://github.com/original0211/CFusion（public，default_branch=main）。
+- 上传前安全修复：panel/src/test/registry.test.mjs 的夹具常量 UUID2 原为一个真实生成过的 UUID（已取消部署所用、从未上线），已替换为明显合成的测试 UUID 并单独提交（435e0c6）；全仓 tracked 文件复查该字符串零命中。
+- 测试：修复后 panel 全量 npm test 113/113 全过，零回归。
+- 推送方式：空仓先以 Contents API 放 README 种子提交，再走 Git Data API（79 blobs → tree → commit → refs/heads/main）；主提交 53bd2462（tree ba1d2795）。
+- 回查验证：远程 HEAD 与 tree 哈希与推送值一致；逐层遍历远程 tree 得 79 个 blob，与本地 git ls-files 的 79 个逐个 sha 对照零差异、无缺失；README 经 Contents API 可读且 sha 与本地一致。
+- 本地仓库已 git remote add origin（只加不 push）；本节为上传后在本地追加，未随本次推送上行。
+
+
+## 八、真机部署（2026-10-22，未完成）
+
+- 连接器与 helper：`custom.cloudflare` 已按 custom-connector-setup 落地，`bin/cf-api` 通过语法检查。`GET /user/tokens/verify` 成功且状态为 active，指定 account 的只读请求成功。
+- KV：`cfusion-kv` 与 `cfusion-session-kv` 均已创建成功。ID 和入口信息只记在本地未提交的 `DEPLOYED.md`，本报告不记录任何密钥、UUID 或管理口令。
+- 核心 Worker：`cfusion-core` 上传停在第一步。`PUT /workers/scripts/cfusion-core` 返回 HTTP 403，错误摘要为 `No access to the specified resource`。随后只读回查不到该脚本。为排除旧端点问题，又对服务内容端点做了一次同内容校验，仍返回相同 403。新建 Worker 的 beta 资源端点返回 HTTP 403 code 10000 `Authentication error`。结论是当前令牌可验证且可写 KV，但没有可用的 Workers script 写入访问。
+- 子域与公开状态：计划域名为 `cfusion-core.brodydung.workers.dev` 与 `cfusion-panel.brodydung.workers.dev`。核心公开根路径返回 404，证明核心未上线。账户 workers 子域只读端点返回 HTTP 403 code 10000，未能通过 API 回读确认。
+- 面板 Worker：`cfusion-panel` 未部署，未构建上传 dist，未设置 `SESSION_KV`、`w` 或 `PANEL_ADMIN_PASSWORD` secret。因为核心上传先失败，后续步骤按纪律停止。
+- 真机验证：core 配置读取与保存、cfusionMeta、clash 与 sing-box 订阅、SESSION_KV 登录改配置注销、optimizer 真实优选源均未执行。WARP 节点 `cid` 与 MASQUE 节点的真实客户端导入仍未验证。
+- 资源边界：本次只新建了两个 `cfusion-*` KV。未修改 `cfnext-backend`、`cfnext-panel`、`cfnext-kv-*` 或其他已有 Worker 与 KV。
+- 恢复条件：给保险库中的 Cloudflare 令牌补足 Workers script 写入权限并确认没有排除新 Worker 的资源范围后，从核心 Worker multipart 上传步骤续跑，不要重复创建已有 KV。
+
+## 九、真机部署（续，2026-10-22 完成）
+
+- 权限复验：补权限后 `GET /accounts/{id}/workers/subdomain`（回读 subdomain=brodydung）与 `GET /workers/scripts` 均成功，前一轮的 403 已消除。
+- core：multipart 上传 `cfusion-core` 成功（core/_worker.js 38,175 字节、compatibility_date=2026-01-20、bindings c→cfusion-kv + u），subdomain enabled=true，settings 回读与计划一致。公开验证：根路径 200 `hello`，`/<UUID>/api/config` 200 JSON。
+- panel：dist 现场构建后 multipart 上传 `cfusion-panel` 成功（nodejs_compat、SESSION_KV、w、PANEL_ADMIN_PASSWORD secret、CORE service binding），settings 回读一致。/health 200，首页 w 模式 200 `hello`，`/<UUID>` 控制台 200（含 window.CFNEW）。
+- 真机连环问题与修复（本地 wrangler 冒烟均未暴露，全部已修并提交）：
+  1. `node:perf_hooks` 在真机 workerd 不存在，模块加载即 500 → preferred.mjs 改用 globalThis.performance。
+  2. workerd fetch 不支持 `redirect:'error'`（undici 专有值）→ outbound-fetch.mjs 的 DoH 查询改 'manual'，靠既有 status!==200 校验保持语义。
+  3. 面板 fetch 同账户 core 的 workers.dev 地址返回 error 1042（Worker 不能 fetch 同账户 workers.dev）→ 面板新增 `CORE` service binding，server 在 w 绑定目标时经绑定通道调 core（outbound-fetch 新增 serviceFetcher 分支，跳过 DNS 预检，绑定本身即信任边界）；新增单测 1 例，全量 114/114。
+  4. cf-api helper 的 multipart part filename 原写 basename，导致嵌套模块 "No such module src/cf-entry.mjs" → 改为完整模块路径（与其文档描述一致）。
+- 会话与防漂移实测（SESSION_KV 实绑）：无会话写配置 401；错口令登录 401；正确口令登录 200；带 session 写普通键成功，core 直读新值且 `cfusionMeta.ver=1`、changedKeys=[dkby]；注销后用旧 cookie 再写 401。防漂移版本链工作正常（验证过程共递增至 ver=4，验证后配置已恢复默认 dkby=no、optimizerAuto=no）。
+- 订阅实测：clash（optimizer 关）200、42 处 vless、36,492 字节；sing-box 200、34 outbounds、rule_set 23 组、约 4.7MB。
+- optimizer 真机实测：开启 optimizerAuto 后 clash 订阅 200、20 个 vless、260 处「优选」命名、约 6.7s 生成完毕——真实 wetest 源在面板 Worker（fetch 出站）上拉取成功、自动池构建成功，非 fail-open 回退（节点构成与关闭时明显不同）。P1 存疑中的「真实页面未线上比对」就此关闭。
+- 部署中一次验证命令被本机服务重启打断，经核对无部分落地，按原步骤重跑完成；个别 urllib 请求出现本机出口代理的流截断，已用 curl 复测覆盖，属本机基础设施噪声非线上问题。
+- 未验清单：WARP 节点 `cid` 字段与 MASQUE 节点的真实客户端（Clash/Mihomo、sing-box）导入仍未实测（无真实客户端环境）；dist 约 1.4MB 已成功上传并运行，免费版体积上限未构成问题。
+- 资源边界：本次只新建 cfusion-core、cfusion-panel（KV 沿用上一轮已建的两个），未修改任何 CFNext 资源。部署参数（域名、KV id、入口）见仓库外本地文件 DEPLOYED.md，本报告不记录 UUID 与管理口令。

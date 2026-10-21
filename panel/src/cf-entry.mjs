@@ -19,6 +19,8 @@ export function prepareCloudflareRuntime(env = {}, { assets, singboxRulesGzBase6
   }
   if (env && env.SESSION_KV) globalThis.__CFUSION_SESSION_KV__ = env.SESSION_KV;
   else delete globalThis.__CFUSION_SESSION_KV__;
+  if (env && env.CORE && typeof env.CORE.fetch === 'function') globalThis.__CFUSION_CORE_FETCHER__ = env.CORE;
+  else delete globalThis.__CFUSION_CORE_FETCHER__;
   if (assets) globalThis.__CFUSION_ASSETS__ = assets;
   if (singboxRulesGzBase64) globalThis.__CFUSION_SINGBOX_RULES_GZ_BASE64__ = singboxRulesGzBase64;
   globalThis.__CFUSION_RUNTIME__ = 'cloudflare';
