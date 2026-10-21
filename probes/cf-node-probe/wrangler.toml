@@ -1,0 +1,13 @@
+name = "cfusion-p4-probe-a"
+main = "src/index.mjs"
+compatibility_date = "2026-01-20"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[[rules]]
+type = "Data"
+globs = ["**/*.json.gz"]
+fallthrough = true
+
+[vars]
+CFUSION_PROBE_VALUE = "probe-a-ok"

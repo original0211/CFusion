@@ -1,0 +1,26 @@
+name = "cfusion-panel"
+main = "dist/worker.mjs"
+compatibility_date = "2026-01-20"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# Optional but recommended when PANEL_ADMIN_PASSWORD is set: without this
+# binding, admin sessions live in one isolate's memory and will not survive
+# isolate restarts or be shared across isolates.
+# Create it with: wrangler kv namespace create SESSION_KV
+# Then uncomment and fill in the id from that command.
+# [[kv_namespaces]]
+# binding = "SESSION_KV"
+# id = "REPLACE_WITH_SESSION_KV_NAMESPACE_ID"
+
+[vars]
+# Bind the panel to exactly one core Worker (private single-Worker mode).
+# Leave empty for public mode. Root HTTPS origin only: no UUID/path/query.
+# w = "https://cfusion-core.example.workers.dev"
+# Set the admin password as a secret instead of a plain var in real use:
+#   wrangler secret put PANEL_ADMIN_PASSWORD
+# PANEL_ADMIN_PASSWORD = ""
+# PANEL_ADMIN_SESSION_TTL_HOURS = "24"
+# Local fixture smoke only (never in production): allow http/private
+# Worker addresses so the panel can talk to a local core on 127.0.0.1.
+# CFNEW_ALLOW_PRIVATE = "yes"
