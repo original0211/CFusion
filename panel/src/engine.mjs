@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
 import { buildSingboxConfig, normalizeNodeNames } from './singbox.mjs';
+import { 边缘过滤家宽节点 } from './jk-probe.mjs';
 export function createSubscriptionEngine(config, uuid) {
 const 基础64文本解码器 = new TextDecoder();
 
@@ -70,6 +71,8 @@ let 启用原生地址 = false;
 
 let 启用家宽链式 = false;
 
+let 家宽自定义源网址 = '';
+
 let 键值配置 = {};
 
 const supportsFreeCpu = Object.hasOwn(config, 'freeCpu');
@@ -106,6 +109,7 @@ const 配置默认值 = {
   ispUnicom: 'yes',
   ispTelecom: 'yes',
   jk: 'no',
+  jkSource: '',
   optimizerAuto: 'no',
   optimizerSource: 'wetest_v4',
   optimizerSourceURL: '',
@@ -203,6 +207,7 @@ function 获取环境配置快照(环境值 = {}) {
     ispUnicom: ['ispUnicom', 'ISPUNICOM', 'ISP_UNICOM'],
     ispTelecom: ['ispTelecom', 'ISPTELECOM', 'ISP_TELECOM'],
     jk: ['jk', 'JK'],
+    jkSource: ['jkSource', 'JKSOURCE', 'JK_SOURCE'],
     optimizerAuto: ['optimizerAuto', 'OPTIMIZER_AUTO'],
     optimizerSource: ['optimizerSource', 'OPTIMIZER_SOURCE'],
     optimizerSourceURL: ['optimizerSourceURL', 'OPTIMIZER_SOURCE_URL'],
@@ -945,6 +950,8 @@ const 家宽缓存期限 = 30 * 60 * 1000;
 
 let 家宽缓存 = null;
 
+let 家宽缓存键 = '';
+
 let 家宽缓存时间 = 0;
 
 const 家宽指令正则 = {};
@@ -1023,14 +1030,12 @@ function 解析家宽清单(原文) {
   return { 节点列表, 证书 };
 }
 
-async function 获取家宽节点() {
-  const 现在 = Date.now();
-  if (家宽缓存 && 现在 - 家宽缓存时间 < 家宽缓存期限) return 家宽缓存;
+async function 拉家宽清单原文(网址) {
   // 节点源的 TLS 很老（没有 TLS1.3，ECDHE 只有 CBC 套件），有的运行环境握不上，
   // 握不上就退回明文再拉一次。清单本身是公开数据。
-  let 原文 = '';
+  const 候选 = /^https:/i.test(网址) ? [网址, 网址.replace(/^https:/i, 'http:')] : [网址];
   let 最后错误 = null;
-  for (const 源 of [家宽节点源, 家宽节点源.replace(/^https:/, 'http:')]) {
+  for (const 源 of 候选) {
     try {
       const 响应 = await fetch(源, {
         headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/plain' },
@@ -1040,16 +1045,47 @@ async function 获取家宽节点() {
         最后错误 = new Error('节点源返回 ' + 响应.status);
         continue;
       }
-      原文 = await 响应.text();
-      break;
+      return await 响应.text();
     } catch (错误) {
       最后错误 = 错误;
     }
   }
-  if (!原文) throw 最后错误 || new Error('节点源没有返回内容');
-  const 结果 = 解析家宽清单(原文);
-  if (!结果.节点列表.length || !结果.证书) throw new Error('没解析出能用的节点');
+  throw 最后错误 || new Error('节点源没有返回内容');
+}
+
+async function 获取家宽节点() {
+  const 现在 = Date.now();
+  // 缓存按源组合分键：改了 jkSource 立刻生效，不用等旧缓存过期。
+  const 缓存键 = 家宽节点源 + '|' + 家宽自定义源网址;
+  if (家宽缓存 && 家宽缓存键 === 缓存键 && 现在 - 家宽缓存时间 < 家宽缓存期限) return 家宽缓存;
+  const 来源 = [家宽节点源];
+  if (家宽自定义源网址 && 家宽自定义源网址 !== 家宽节点源) 来源.push(家宽自定义源网址);
+  let 节点列表 = [];
+  let 证书 = null;
+  let 最后错误 = null;
+  const 已见地址 = new Set();
+  for (const 源 of 来源) {
+    try {
+      const 解析 = 解析家宽清单(await 拉家宽清单原文(源));
+      if (!证书 && 解析.证书) 证书 = 解析.证书;
+      for (const 节点 of 解析.节点列表) {
+        const 键 = 节点.地址 + ':' + 节点.端口;
+        if (已见地址.has(键)) continue;
+        已见地址.add(键);
+        节点列表.push(节点);
+      }
+    } catch (错误) {
+      // 单个源失败不拖垮其他源；全部失败才在下面抛错。
+      最后错误 = 错误;
+    }
+  }
+  if (!节点列表.length || !证书) throw 最后错误 || new Error('没解析出能用的节点');
+  // 边缘侧连通性过滤：连不通的志愿者节点在生成订阅前就剔除（见 jk-probe.mjs，
+  // 非 Worker 运行时或探测异常时 fail-open 保留全部）。
+  节点列表 = await 边缘过滤家宽节点(节点列表);
+  const 结果 = { 节点列表, 证书 };
   家宽缓存 = 结果;
+  家宽缓存键 = 缓存键;
   家宽缓存时间 = 现在;
   return 结果;
 }
@@ -1662,18 +1698,16 @@ async function 处理订阅值(请求241, 用户240 = null) {
       }
     }
   }
-  let 是否值236 = false;
-  if (语言来源凭据 === 'fa' || 语言来源凭据 === 'fa-IR') {
-    是否值236 = true;
-  } else if (语言来源凭据 === 'zh' || 语言来源凭据 === 'zh-CN') {
-    是否值236 = false;
-  } else {
-    // 如果没有Cookie，使用浏览器语言检测
+  let 语言码236 = 'zh';
+  if (语言来源凭据 === 'en' || 语言来源凭据 === 'en-US' || 语言来源凭据 === 'en-GB') {
+    语言码236 = 'en';
+  } else if (!语言来源凭据) {
+    // 如果没有Cookie，使用浏览器语言检测；已下线的语言（如 fa）回退简体中文
     const 接受语言 = 请求241.headers.get('Accept-Language') || '';
     const 浏览器语言 = 接受语言.split(',')[0].split('-')[0].toLowerCase();
-    是否值236 = 浏览器语言 === 'fa' || 接受语言.includes('fa-IR') || 接受语言.includes('fa');
+    语言码236 = 浏览器语言 === 'en' ? 'en' : 'zh';
   }
-  const 语言值 = 是否值236 ? 'fa-IR' : 'zh-CN';
+  const 语言值 = 语言码236 === 'en' ? 'en' : 'zh-CN';
   const 本地值235 = {
     zh: {
       title: 解码64('6K6i6ZiF5Lit5b+D'),
@@ -1681,8 +1715,20 @@ async function 处理订阅值(请求241, 用户240 = null) {
       selectClient: '[ 选择客户端 ]',
       systemStatus: '[ 系统状态 ]',
       configManagement: '[ 配置管理 ]',
-      relatedLinks: '[ 相关链接 ]',
       checking: '检测中...',
+      checkDone: '检测完成',
+      echLabel: 'ECH状态:',
+      freeCpuLabel: 'Free CPU 保护',
+      freeCpuHint: '单连接上下载合计最多 384 KiB 或 96 个数据块，超过就断开。客户端需自行重连，下载和视频可能中断。保存后对新连接生效，不能保证零超限。',
+      freeCpuUnsupported: '当前内核不支持，请先更新配套内核。',
+      latencyTestHint: '检测可用性；延迟按面板服务器位置测得。',
+      optFilterTitle: '优选IP筛选设置',
+      optIpVersion: 'IP版本选择',
+      optIsp: '运营商选择',
+      optIspMobile: '移动',
+      optIspUnicom: '联通',
+      optIspTelecom: '电信',
+      optFilterHint: '选择要使用的IP版本和运营商，未选中的将被过滤',
       workerRegion: 'Worker地区: ',
       detectionMethod: '检测方式: ',
       proxyIPStatus: 解码64('UHJveHlJUOeKtuaAgTog'),
@@ -1690,8 +1736,8 @@ async function 处理订阅值(请求241, 用户240 = null) {
       regionMatch: '地区匹配: ',
       selectionLogic: '选择逻辑: ',
       kvStatusChecking: '检测KV状态中...',
-      kvEnabled: '✅ KV存储已启用，可以使用配置管理功能',
-      kvDisabled: '⚠️ KV存储未启用或未配置',
+      kvEnabled: '✓ KV存储已启用，可以使用配置管理功能',
+      kvDisabled: '⚠ KV存储未启用或未配置',
       specifyRegion: '指定地区 (wk):',
       autoDetect: 解码64('5a6Y5pa555u06L+e'),
       saveRegion: '保存地区配置',
@@ -1744,6 +1790,8 @@ async function 处理订阅值(请求241, 用户240 = null) {
       jkEnable: '开启家宽链式',
       jkHint: 解码64('5byA5LqG5LmL5ZCO5a6i5oi356uv5YiX6KGo5aSa5LiA5Liq44CMQ0xBU0gg5a625a6944CN44CCQ0Yg6IqC54K55bim6Lev77yM5Ye65Y+j5o2i5oiQ5pel5pys44CB6Z+p5Zu9562J5Zyw55qE5a625bqt5a695bim44CC6KaBIENsYXNoIE1ldGEg5YaF5qC4IDEuMTkuMjUg5Lul5LiK5omN6K6k77yMQ2xhc2ggVmVyZ2UgUmV244CBRmxDbGFzaOOAgUNNRkEg6YO96KGM44CC6IqC54K55piv572R5Y+L5YWx5Lqr55qE77yM5pe25LiN5pe25Lya5o6J77yM6K6i6ZiF6YeM5Lya6Ieq5bex5o2i44CC'),
       jkClient: 'CLASH 家宽',
+      jkSourceLabel: '自定义家宽节点源 (jkSource)',
+      jkSourceHint: '可选。填一个与 VPN Gate 相同清单格式的地址，节点会与默认源合并、按地址去重；生成家宽订阅时会在边缘逐个探测连通性，连不通的自动剔除。',
       allowAPIManagement: '允许API管理 (ae):',
       regionMatching: '地区匹配 (rm):',
       downgradeControl: 解码64('5Ye656uZ5pa55byPIChxaik6'),
@@ -1751,7 +1799,7 @@ async function 处理订阅值(请求241, 用户240 = null) {
       preferredControl: '优选控制 (yxby):',
       saveAdvanced: '保存高级配置',
       loading: '加载中...',
-      currentConfig: '📍 当前路径配置',
+      currentConfig: '当前路径配置',
       refreshConfig: '刷新配置',
       resetConfig: '重置配置',
       subscriptionCopied: 解码64('6K6i6ZiF6ZO+5o6l5bey5aSN5Yi2'),
@@ -1776,7 +1824,7 @@ async function 处理订阅值(请求241, 用户240 = null) {
       builtinPreferredHint: 解码64('5o6n5Yi26K6i6ZiF5Lit5YyF5ZCr5ZOq5Lqb5YaF572u5LyY6YCJ6IqC54K544CC6buY6K6k5YWo6YOo5ZCv55So44CC'),
       apiEnabledDefault: '默认（关闭API）',
       apiEnabledYes: '开启API管理',
-      apiEnabledHint: '⚠️ 安全提醒：开启后允许通过API动态添加优选IP。建议仅在需要时开启。',
+      apiEnabledHint: '⚠ 安全提醒：开启后允许通过API动态添加优选IP。建议仅在需要时开启。',
       regionMatchingDefault: '默认（启用地区匹配）',
       regionMatchingNo: '关闭地区匹配',
       regionMatchingHint: '设置为"关闭"时不进行地区智能匹配',
@@ -1786,6 +1834,7 @@ async function 处理订阅值(请求241, 用户240 = null) {
       downgradeControlHint: 解码64('5rKh5aGr5Luj55CG5pe25LiJ5Liq6YCJ6aG56YO95LiA5qC377yM6YO95piv55u06L+e44CC5Y+q6LWw5Luj55CG5pe26L+e5LiN5LiK5bCx5pat5byA77yM5Ye65Y+jIElQIOS4jeS8mua8jw=='),
       tlsControlDefault: '默认（保留所有节点）',
       tlsControlYes: '仅TLS节点',
+      tlsControlNo: '关闭（保留所有节点）',
       tlsControlHint: '设置为"仅TLS节点"时只生成带TLS的节点，不生成非TLS节点（如80端口）',
       preferredControlDefault: '默认（启用优选）',
       preferredControlYes: '关闭优选',
@@ -1804,8 +1853,6 @@ async function 处理订阅值(请求241, 用户240 = null) {
         GB: '🇬🇧 英国'
       },
       terminal: '终端 v3.1',
-      githubProject: 'GitHub 项目',
-      优选工具: '优选工具',
       autoDetectClient: '自动识别',
       selectionLogicText: '同地区 → 邻近地区 → 其他地区',
       customIPDisabledHint: 解码64('5L2/55So6Ieq5a6a5LmJUHJveHlJUOaXtu+8jOWcsOWMuumAieaLqeW3suemgeeUqA=='),
@@ -1832,167 +1879,180 @@ async function 处理订阅值(请求241, 用户240 = null) {
       kvCheckFailedStatus: 'KV存储检测失败 - 状态码: ',
       kvCheckFailedError: 'KV存储检测失败 - 错误: '
     },
-    fa: {
-      title: 'مرکز اشتراک',
-      subtitle: 'پشتیبانی چند کلاینت • انتخاب هوشمند • تولید یک کلیکی',
-      selectClient: '[ انتخاب کلاینت ]',
-      systemStatus: '[ وضعیت سیستم ]',
-      configManagement: '[ مدیریت تنظیمات ]',
-      relatedLinks: '[ لینک‌های مرتبط ]',
-      checking: 'در حال بررسی...',
-      workerRegion: 'منطقه Worker: ',
-      detectionMethod: 'روش تشخیص: ',
-      proxyIPStatus: 解码64('2YjYtti524zYqiBQcm94eUlQOiA='),
-      currentIP: 'IP فعلی: ',
-      regionMatch: 'تطبیق منطقه: ',
-      selectionLogic: 'منطق انتخاب: ',
-      kvStatusChecking: 'در حال بررسی وضعیت KV...',
-      kvEnabled: '✅ ذخیره‌سازی KV فعال است، می‌توانید از مدیریت تنظیمات استفاده کنید',
-      kvDisabled: '⚠️ ذخیره‌سازی KV فعال نیست یا پیکربندی نشده است',
-      specifyRegion: 'تعیین منطقه (wk):',
-      autoDetect: 'اتصال مستقیم رسمی',
-      saveRegion: 'ذخیره تنظیمات منطقه',
-      protocolSelection: 'انتخاب پروتکل:',
-      enableProtoV: 解码64('2YHYudin2YTigIzYs9in2LLbjCDZvtix2YjYqtqp2YQgVkxFU1M='),
-      enableProtoT: 解码64('2YHYudin2YTigIzYs9in2LLbjCDZvtix2YjYqtqp2YQgVHJvamFu'),
-      enableXhttp: 'فعال‌سازی پروتکل xhttp',
-      enableECH: 'فعال‌سازی ECH (Encrypted Client Hello)',
-      enableECHHint: 'پس از فعال‌سازی، در هر بار تازه‌سازی اشتراک، پیکربندی ECH به‌روز به‌طور خودکار از DoH دریافت شده و به لینک‌ها اضافه می‌شود',
-      customDNS: 'سرور DNS سفارشی',
-      customDNSPlaceholder: 'مثال: https://223.5.5.5/dns-query',
-      customDNSHint: 'آدرس سرور DNS برای جستجوی پیکربندی ECH (فرمت DoH)',
-      customECHDomain: 'دامنه ECH سفارشی',
-      customECHDomainPlaceholder: 'مثال: cloudflare-ech.com',
-      customECHDomainHint: 'دامنه استفاده شده در پیکربندی ECH، خالی بگذارید تا از مقدار پیش‌فرض استفاده شود',
-      altPassword: 解码64('2LHZhdiyINi52KjZiNixIFRyb2phbiAo2KfYrtiq24zYp9ix24wpOg=='),
-      customPath: 'مسیر سفارشی (d):',
-      customIP: 解码64('UHJveHlJUCDYs9mB2KfYsdi024wgKHApOg=='),
-      preferredIPs: 'لیست IP ترجیحی (yx):',
-      preferredIPsURL: 'URL منبع IP ترجیحی (yxURL):',
-      latencyTest: 'تست تاخیر',
-      latencyTestIP: 'IP/دامنه تست:',
-      latencyTestIPPlaceholder: 'IP یا دامنه وارد کنید، چند مورد با کاما جدا شوند',
-      latencyTestPort: 'پورت:',
-      startTest: 'شروع تست',
-      stopTest: 'توقف تست',
-      testResult: 'نتیجه تست:',
-      addToYx: 'افزودن به لیست ترجیحی',
-      addSelectedToYx: 'افزودن موارد انتخاب شده',
-      selectAll: 'انتخاب همه',
-      deselectAll: 'لغو انتخاب',
-      testingInProgress: 'در حال تست...',
-      testComplete: 'تست کامل شد',
-      latencyMs: 'تاخیر',
-      timeout: 'زمان تمام شد',
-      ipSource: 'منبع IP:',
-      manualInput: 'ورودی دستی',
-      cfRandomIP: 'IP تصادفی CF',
-      urlFetch: 'دریافت از URL',
-      randomCount: 'تعداد تولید:',
-      fetchURL: 'URL دریافت:',
-      fetchURLPlaceholder: 'آدرس URL لیست IP را وارد کنید',
-      generateIP: 'تولید IP',
-      fetchIP: 'دریافت IP',
-      socks5Config: 解码64('2KrZhti424zZhdin2Kog2b7YsdmI2qnYs9uMIChzKTo='),
-      customHomepage: 'URL صفحه اصلی سفارشی (homepage):',
-      customHomepagePlaceholder: 'مثال: https://example.com',
-      customHomepageHint: 'تنظیم URL سفارشی به عنوان استتار صفحه اصلی. هنگام دسترسی به مسیر اصلی / محتوای این URL نمایش داده می‌شود. اگر خالی بگذارید صفحه ترمینال پیش‌فرض نمایش داده می‌شود.',
-      saveConfig: 'ذخیره تنظیمات',
-      advancedControl: 'کنترل پیشرفته',
-      subscriptionConverter: 'آدرس تبدیل اشتراک:',
-      builtinPreferred: 'نوع ترجیحی داخلی:',
-      enablePreferredDomain: 'فعال‌سازی دامنه ترجیحی',
-      enablePreferredIP: 'فعال‌سازی IP ترجیحی',
-      enableNativeAddress: 'فعال‌سازی آدرس اصلی',
-      enableGitHubPreferred: 'فعال‌سازی ترجیح سفارشی',
-      jkSection: 'زنجیره اینترنت خانگی',
-      jkEnable: 'فعال‌سازی زنجیره اینترنت خانگی',
-      jkHint: 解码64('2b7YsyDYp9iyINmB2LnYp9mE4oCM2LPYp9iy24zYjCDar9iy24zZhtmHIMKrQ0xBU0gg2K7Yp9mG2q/bjMK7INio2Ycg2YHZh9ix2LPYqiDaqdmE2KfbjNmG2KrigIzZh9inINin2LbYp9mB2Ycg2YXbjOKAjNi02YjYry4g2q/YsdmH4oCM2YfYp9uMIENGINmF2LPbjNixINix2Kcg2KjYp9iyINmF24zigIzaqdmG2YbYryDZiCDYrtix2YjYrNuMINin2LIg2KfbjNmG2KrYsdmG2Kog2K7Yp9mG2q/bjCDamNin2b7ZhtiMINqp2LHZhyDZiCDaqdi02YjYsdmH2KfbjCDYr9uM2q/YsSDYp9iz2KouINmB2YLYtyDZh9iz2KrZhyBDbGFzaCBNZXRhINmG2LPYrtmHIDEuMTkuMjUg2KjZhyDYqNin2YTYpyDYotmGINix2Kcg2YXbjOKAjNi02YbYp9iz2K/YmyBDbGFzaCBWZXJnZSBSZXbYjCBGbENsYXNoINmIIENNRkEg2qnYp9ixINmF24zigIzaqdmG2YbYry4g2q/YsdmH4oCM2YfYpyDYp9i02KrYsdin2qnbjCDZh9iz2KrZhtivINmIINqv2KfZh9uMINmC2LfYuSDZhduM4oCM2LTZiNmG2K/YjCDYp9i02KrYsdin2qkg2K7ZiNiv2LQg2q/YsdmHINiv24zar9ix24wg2LHYpyDYp9mG2KrYrtin2Kgg2YXbjOKAjNqp2YbYry4='),
-      jkClient: 'CLASH خانگی',
-      allowAPIManagement: 'اجازه مدیریت API (ae):',
-      regionMatching: 'تطبیق منطقه (rm):',
-      downgradeControl: 解码64('2LHZiNi0INiu2LHZiNisIChxaik6'),
-      tlsControl: 'کنترل TLS (dkby):',
-      preferredControl: 'کنترل ترجیحی (yxby):',
-      saveAdvanced: 'ذخیره تنظیمات پیشرفته',
-      loading: 'در حال بارگذاری...',
-      currentConfig: '📍 پیکربندی مسیر فعلی',
-      refreshConfig: 'تازه‌سازی تنظیمات',
-      resetConfig: 'بازنشانی تنظیمات',
-      subscriptionCopied: 'لینک اشتراک کپی شد',
-      autoSubscriptionCopied: 'لینک اشتراک تشخیص خودکار کپی شد، کلاینت هنگام دسترسی بر اساس User-Agent به طور خودکار تشخیص داده و قالب مربوطه را برمی‌گرداند',
-      altPasswordPlaceholder: 'خالی بگذارید تا از UUID استفاده شود',
-      altPasswordHint: 解码64('2LHZhdiyINi52KjZiNixIFRyb2phbiDYs9mB2KfYsdi024wg2LHYpyDYqtmG2LjbjNmFINqp2YbbjNivLiDYp9qv2LEg2K7Yp9mE24wg2Kjar9iw2KfYsduM2K8g2KfYsiBVVUlEINin2LPYqtmB2KfYr9mHINmF24zigIzYtNmI2K8uINqp2YTYp9uM2YbYqiDYqNmHINi32YjYsSDYrtmI2K/aqdin2LEg2LHZhdiyINi52KjZiNixINix2Kcg2KjYpyBTSEEyMjQg2YfYtCDZhduM4oCM2qnZhtivLg=='),
-      protocolHint: 解码64('2YXbjOKAjNiq2YjYp9mG24zYryDahtmG2K/bjNmGINm+2LHZiNiq2qnZhCDYsdinINmH2YXYstmF2KfZhiDZgdi52KfZhCDaqdmG24zYry4g2KfYtNiq2LHYp9qpINqv2LHZh+KAjNmH2KfbjCDZvtix2YjYqtqp2YTigIzZh9in24wg2KfZhtiq2K7Yp9ioINi02K/ZhyDYsdinINiq2YjZhNuM2K8g2YXbjOKAjNqp2YbYry48YnI+4oCiIFZMRVNTIFdTOiDZvtix2YjYqtqp2YQg2KfYs9iq2KfZhtiv2KfYsdivINmF2KjYqtmG24wg2KjYsSBXZWJTb2NrZXQ8YnI+4oCiIFRyb2phbjog2KfYrdix2KfYsiDZh9mI24zYqiDYqNinINix2YXYsiDYudio2YjYsSBTSEEyMjQ8YnI+4oCiIHhodHRwOiDZvtix2YjYqtqp2YQg2KfYs9iq2KrYp9ixINmF2KjYqtmG24wg2KjYsSBIVFRQIFBPU1QgKNmG24zYp9iyINio2Ycg2KfYqti12KfZhCDYr9in2YXZhtmHINiz2YHYp9ix2LTbjCDZiCDZgdi52KfZhOKAjNiz2KfYstuMIGdSUEMg2K/Yp9ix2K8p'),
+en: {
+      title: 'Subscription Center',
+      subtitle: 'Multi-client support • Smart preferred routing • One-click generation',
+      selectClient: '[ Select Client ]',
+      systemStatus: '[ System Status ]',
+      configManagement: '[ Config Management ]',
+      checking: 'Checking...',
+      checkDone: 'Check complete',
+      echLabel: 'ECH status:',
+      freeCpuLabel: 'Free CPU Protection',
+      freeCpuHint: 'At most 384 KiB of combined upload and download, or 96 chunks, per connection; the connection is dropped when the limit is exceeded. Clients must reconnect on their own, and downloads and video may be interrupted. Takes effect for new connections after saving; zero overage is not guaranteed.',
+      freeCpuUnsupported: 'The current core does not support this. Please update the matching core first.',
+      latencyTestHint: 'Checks availability; latency is measured from the panel server location.',
+      optFilterTitle: 'Preferred IP Filter Settings',
+      optIpVersion: 'IP Version',
+      optIsp: 'Carrier',
+      optIspMobile: 'Mobile',
+      optIspUnicom: 'Unicom',
+      optIspTelecom: 'Telecom',
+      optFilterHint: 'Select the IP versions and carriers to use. Unselected ones are filtered out.',
+      workerRegion: 'Worker region: ',
+      detectionMethod: 'Detection method: ',
+      proxyIPStatus: 'ProxyIP status: ',
+      currentIP: 'Current IP: ',
+      regionMatch: 'Region match: ',
+      selectionLogic: 'Selection logic: ',
+      kvStatusChecking: 'Checking KV storage...',
+      kvEnabled: '✓ KV storage is enabled. Config management is available.',
+      kvDisabled: '⚠ KV storage is not enabled or not configured',
+      specifyRegion: 'Specify region (wk):',
+      autoDetect: 'Official direct',
+      saveRegion: 'Save region config',
+      protocolSelection: 'Protocols:',
+      enableProtoV: 'Enable VLESS',
+      enableProtoT: 'Enable Trojan',
+      enableXhttp: 'Enable xhttp',
+      altPassword: 'Trojan password (optional):',
+      customPath: 'Custom path (d):',
+      customIP: 'Custom ProxyIP (p):',
+      preferredIPs: 'Preferred IP list (yx):',
+      preferredIPsURL: 'Preferred IP source URL (yxURL):',
+      latencyTest: 'Latency Test',
+      latencyTestIP: 'Test IP / domain:',
+      latencyTestIPPlaceholder: 'Enter IPs or domains, separated by commas',
+      latencyTestPort: 'Port:',
+      startTest: 'Start test',
+      stopTest: 'Stop test',
+      testResult: 'Test results:',
+      addToYx: 'Add to preferred list',
+      addSelectedToYx: 'Add selected to preferred list',
+      selectAll: 'Select all',
+      deselectAll: 'Deselect all',
+      testingInProgress: 'Testing...',
+      testComplete: 'Test complete',
+      latencyMs: 'Latency',
+      timeout: 'Timeout',
+      ipSource: 'IP source:',
+      manualInput: 'Manual input',
+      cfRandomIP: 'CF random IPs',
+      urlFetch: 'Fetch from URL',
+      randomCount: 'Count:',
+      fetchURL: 'Fetch URL:',
+      fetchURLPlaceholder: 'Enter the URL of a preferred IP list',
+      generateIP: 'Generate IPs',
+      fetchIP: 'Fetch IPs',
+      socks5Config: 'Proxy config (s):',
+      customHomepage: 'Custom homepage URL (homepage):',
+      customHomepagePlaceholder: 'e.g. https://example.com',
+      customHomepageHint: 'Set a custom URL as the homepage disguise. Visiting the root path / shows the content of that URL. Leave empty to show the default terminal page.',
+      saveConfig: 'Save config',
+      advancedControl: 'Advanced Controls',
+      subscriptionConverter: 'Subscription converter URL:',
+      builtinPreferred: 'Built-in preferred types:',
+      enablePreferredDomain: 'Enable preferred domains',
+      enablePreferredIP: 'Enable preferred IPs',
+      enableNativeAddress: 'Enable native addresses',
+      enableGitHubPreferred: 'Enable custom preferred',
+      jkSection: 'Home Broadband Chain',
+      jkEnable: 'Enable home broadband chaining',
+      jkHint: 'When enabled, the client list gains a CLASH Home entry. Traffic enters via CF nodes and exits through residential broadband in Japan, South Korea and elsewhere. Requires a Clash Meta core 1.19.25 or newer; Clash Verge Rev, FlClash and CMFA all work. The nodes are shared by volunteers and drop from time to time; the subscription rotates automatically.',
+      jkClient: 'CLASH Home',
+      jkSourceLabel: 'Custom home node source (jkSource)',
+      jkSourceHint: 'Optional. Enter a list URL in the same format as VPN Gate. Its nodes are merged with the default source and deduplicated by address; when a home subscription is generated, each node is probed for reachability at the edge and unreachable ones are dropped automatically.',
+      allowAPIManagement: 'Allow API management (ae):',
+      regionMatching: 'Region matching (rm):',
+      downgradeControl: 'Outbound mode (qj):',
+      tlsControl: 'TLS control (dkby):',
+      preferredControl: 'Preferred control (yxby):',
+      saveAdvanced: 'Save advanced config',
+      loading: 'Loading...',
+      currentConfig: 'Current Path Config',
+      refreshConfig: 'Refresh config',
+      resetConfig: 'Reset config',
+      subscriptionCopied: 'Subscription link copied',
+      autoSubscriptionCopied: 'Auto-detect subscription link copied. When a client fetches it, the format is selected automatically from the User-Agent.',
+      altPasswordPlaceholder: 'Leave empty to use the UUID',
+      altPasswordHint: 'Set a custom Trojan password. Leave empty to use the UUID. Clients hash the password with SHA224 automatically.',
+      protocolHint: 'Multiple protocols can be enabled at once. The subscription generates nodes for the selected protocols.<br>• VLESS WS: standard protocol over WebSocket<br>• Trojan: SHA224 password authentication<br>• xhttp: camouflage protocol over HTTP POST (requires a custom domain with gRPC enabled)',
+      enableECH: 'Enable ECH (Encrypted Client Hello)',
+      enableECHHint: 'When enabled, the latest ECH config is fetched from DoH and added to links every time the subscription is refreshed',
+      customDNS: 'Custom DNS server',
+      customDNSPlaceholder: 'e.g. https://223.5.5.5/dns-query',
+      customDNSHint: 'DNS server used for ECH config lookups (DoH format)',
+      customECHDomain: 'Custom ECH domain',
+      customECHDomainPlaceholder: 'e.g. cloudflare-ech.com',
+      customECHDomainHint: 'Domain used in the ECH config. Leave empty to use the default.',
       alpn: 'TLS ALPN',
-      alpnDefault: 'پیش‌فرض (خالی، مذاکره توسط کلاینت)',
-      alpnHint: 'فقط به لینک‌های TLS اضافه می‌شود؛ اگر خالی باشد alpn نوشته نمی‌شود.',
-      saveProtocol: 'ذخیره تنظیمات پروتکل',
-      subscriptionConverterPlaceholder: 'پیش‌فرض: https://url.v1.mk/sub',
-      subscriptionConverterHint: 'تبدیل اشتراک به صورت داخلی پیاده‌سازی شده است و نیازی به API خارجی ندارد. این فیلد فقط برای سازگاری حفظ شده و می‌توان آن را خالی گذاشت.',
-      builtinPreferredHint: 'کنترل اینکه کدام گره‌های ترجیحی داخلی در اشتراک گنجانده شوند. به طور پیش‌فرض همه فعال هستند.',
-      apiEnabledDefault: 'پیش‌فرض (بستن API)',
-      apiEnabledYes: 'فعال‌سازی مدیریت API',
-      apiEnabledHint: '⚠️ هشدار امنیتی: فعال‌سازی این گزینه اجازه می‌دهد IP های ترجیحی از طریق API به طور پویا اضافه شوند. توصیه می‌شود فقط در صورت نیاز فعال کنید.',
-      regionMatchingDefault: 'پیش‌فرض (فعال‌سازی تطبیق منطقه)',
-      regionMatchingNo: 'بستن تطبیق منطقه',
-      regionMatchingHint: 'وقتی "بستن" تنظیم شود، تطبیق هوشمند منطقه انجام نمی‌شود',
-      downgradeControlDefault: 解码64('2KfZiNmE2YjbjNiqINio2Kcg2b7YsdmI2qnYs9uMICjZvtuM2LTigIzZgdix2LYp'),
-      downgradeControlNo: 解码64('2KfZiNmE2YjbjNiqINio2Kcg2KfYqti12KfZhCDZhdiz2KrZgtuM2YXYjCDYr9ixINi12YjYsdiqINiu2LfYpyDZvtix2Yjaqdiz24w='),
-      downgradeControlOnly: 解码64('2YHZgti3INm+2LHZiNqp2LPbjNiMINio2K/ZiNmGINio2KfYstqv2LTYqg=='),
-      downgradeControlHint: 解码64('2Kfar9ixINm+2LHZiNqp2LPbjCDYqtmG2LjbjNmFINmG2LTYr9mHINio2KfYtNivINmH2LEg2LPZhyDar9iy24zZhtmHINuM2qnYs9in2YYg2Ygg2YXYs9iq2YLbjNmFINmH2LPYqtmG2K8uINiv2LEg2K3Yp9mE2Kog2YHZgti3INm+2LHZiNqp2LPbjNiMINin2KrYtdin2YQg2YbYp9mF2YjZgdmCINmC2LfYuSDZhduM4oCM2LTZiNivINmIIElQINiu2LHZiNis24wg2YHYp9i0INmG2YXbjOKAjNi02YjYrw=='),
-      tlsControlDefault: 'پیش‌فرض (حفظ همه گره‌ها)',
-      tlsControlYes: 'فقط گره‌های TLS',
-      tlsControlHint: 'وقتی "فقط گره‌های TLS" تنظیم شود، فقط گره‌های با TLS تولید می‌شوند، گره‌های غیر TLS (مانند پورت 80) تولید نمی‌شوند',
-      preferredControlDefault: 'پیش‌فرض (فعال‌سازی ترجیح)',
-      preferredControlYes: 'بستن ترجیح',
-      preferredControlHint: 'وقتی "بستن ترجیح" تنظیم شود، فقط از آدرس اصلی استفاده می‌شود، گره‌های IP و دامنه ترجیحی تولید نمی‌شوند',
+      alpnDefault: 'Default (empty, negotiated by the client)',
+      alpnHint: 'Only added to TLS node link parameters; leave empty to omit alpn.',
+      saveProtocol: 'Save protocol config',
+      subscriptionConverterPlaceholder: 'Default: https://url.v1.mk/sub',
+      subscriptionConverterHint: 'Subscription conversion is implemented internally; no external API is needed. Kept for compatibility only and can be left empty.',
+      builtinPreferredHint: 'Controls which built-in preferred nodes are included in subscriptions. All enabled by default.',
+      apiEnabledDefault: 'Default (API off)',
+      apiEnabledYes: 'Enable API management',
+      apiEnabledHint: '⚠ Security notice: when enabled, preferred IPs can be added dynamically via the API. Enable only when needed.',
+      regionMatchingDefault: 'Default (region matching on)',
+      regionMatchingNo: 'Disable region matching',
+      regionMatchingHint: 'When set to Disable, no smart region matching is performed',
+      downgradeControlDefault: 'Prefer proxy (default)',
+      downgradeControlNo: 'Prefer direct, fall back to proxy on failure',
+      downgradeControlOnly: 'Proxy only, no fallback',
+      downgradeControlHint: 'With no proxy configured, all three options behave the same: direct. With Proxy only, a failed connection simply drops; the exit IP never leaks',
+      tlsControlDefault: 'Default (keep all nodes)',
+      tlsControlYes: 'TLS nodes only',
+      tlsControlNo: 'Off (keep all nodes)',
+      tlsControlHint: 'When set to TLS nodes only, only TLS nodes are generated; non-TLS nodes (such as port 80) are skipped',
+      preferredControlDefault: 'Default (preferred on)',
+      preferredControlYes: 'Disable preferred',
+      preferredControlHint: 'When set to Disable preferred, only native addresses are used; no preferred IP or domain nodes are generated',
       regionNames: {
-        CF: '🌐 مستقیم رسمی',
-        HK: '🇭🇰 هنگ کنگ',
-        US: '🇺🇸 آمریکا',
-        SG: '🇸🇬 سنگاپور',
-        JP: '🇯🇵 ژاپن',
-        KR: '🇰🇷 کره جنوبی',
-        DE: '🇩🇪 آلمان',
-        SE: '🇸🇪 سوئد',
-        NL: '🇳🇱 هلند',
-        FI: '🇫🇮 فنلاند',
-        GB: '🇬🇧 بریتانیا'
+        CF: '🌐 Official direct',
+        HK: '🇭🇰 Hong Kong',
+        US: '🇺🇸 United States',
+        SG: '🇸🇬 Singapore',
+        JP: '🇯🇵 Japan',
+        KR: '🇰🇷 South Korea',
+        DE: '🇩🇪 Germany',
+        SE: '🇸🇪 Sweden',
+        NL: '🇳🇱 Netherlands',
+        FI: '🇫🇮 Finland',
+        GB: '🇬🇧 United Kingdom'
       },
-      terminal: 'ترمینال v3.1',
-      githubProject: 'پروژه GitHub',
-      优选工具: 'ابزار ترجیح IP',
-      autoDetectClient: 'تشخیص خودکار',
-      selectionLogicText: 'هم‌منطقه → منطقه مجاور → سایر مناطق',
-      customIPDisabledHint: 解码64('2YfZhtqv2KfZhSDYp9iz2KrZgdin2K/ZhyDYp9iyIFByb3h5SVAg2LPZgdin2LHYtNuM2Iwg2KfZhtiq2K7Yp9ioINmF2YbYt9mC2Ycg2LrbjNix2YHYudin2YQg2KfYs9iq'),
-      customIPMode: 解码64('2K3Yp9mE2KogUHJveHlJUCDYs9mB2KfYsdi024wgKNmF2KrYutuM2LEgcCDZgdi52KfZhCDYp9iz2Kop'),
-      customIPModeDesc: 'حالت IP سفارشی (تطبیق منطقه غیرفعال است)',
-      usingCustomProxyIP: 解码64('2KfYs9iq2YHYp9iv2Ycg2KfYsiBQcm94eUlQINiz2YHYp9ix2LTbjDog'),
-      customIPConfig: ' (پیکربندی متغیر p)',
-      customIPModeDisabled: 'حالت IP سفارشی، انتخاب منطقه غیرفعال است',
-      manualRegion: 'تعیین منطقه دستی',
-      manualRegionDesc: ' (تعیین دستی)',
-      proxyIPAvailable: 解码64('MTAvMTAg2K/YsSDYr9iz2KrYsdizICjYr9in2YXZhtmHINm+24zYtOKAjNmB2LHYtiBQcm94eUlQINiv2LEg2K/Ys9iq2LHYsyDYp9iz2Kop'),
-      smartSelection: 'انتخاب هوشمند نزدیک در حال انجام است',
-      sameRegionIP: 'IP هم‌منطقه در دسترس است (1)',
-      cloudflareDetection: 'اتصال مستقیم رسمی',
-      detectionFailed: 'تشخیص ناموفق',
-      apiTestResult: 'نتیجه تشخیص API: ',
-      apiTestTime: 'زمان تشخیص: ',
-      apiTestFailed: 'تشخیص API ناموفق: ',
-      unknownError: 'خطای ناشناخته',
-      apiTestError: 'تست API ناموفق: ',
-      kvNotConfigured: 'ذخیره‌سازی KV پیکربندی نشده است، نمی‌توانید از عملکرد مدیریت تنظیمات استفاده کنید.\\n\\nلطفا در Cloudflare Workers:\\n1. فضای نام KV ایجاد کنید\\n2. متغیر محیطی C را پیوند دهید\\n3. کد را دوباره مستقر کنید',
-      kvNotEnabled: 'ذخیره‌سازی KV پیکربندی نشده است',
-      kvCheckFailed: 'بررسی ذخیره‌سازی KV ناموفق: خطای فرمت پاسخ',
-      kvCheckFailedStatus: 'بررسی ذخیره‌سازی KV ناموفق - کد وضعیت: ',
-      kvCheckFailedError: 'بررسی ذخیره‌سازی KV ناموفق - خطا: '
+      terminal: 'Terminal v3.1',
+      autoDetectClient: 'Auto-detect',
+      selectionLogicText: 'Same region → nearby region → other regions',
+      customIPDisabledHint: 'A custom ProxyIP is in use; the region selector below is disabled',
+      customIPMode: 'Custom ProxyIP mode (p variable enabled)',
+      customIPModeDesc: 'Custom IP mode (region matching disabled)',
+      usingCustomProxyIP: 'Using custom ProxyIP: ',
+      customIPConfig: ' (p variable config)',
+      customIPModeDisabled: 'Custom IP mode, region selection disabled',
+      manualRegion: 'Manually specified region',
+      manualRegionDesc: ' (manual)',
+      proxyIPAvailable: '10/10 available (preset ProxyIP domains usable)',
+      smartSelection: 'Smart nearby selection in progress',
+      sameRegionIP: 'Same-region IP available (1)',
+      cloudflareDetection: 'Official direct',
+      detectionFailed: 'Detection failed',
+      apiTestResult: 'API test result: ',
+      apiTestTime: 'Test time: ',
+      apiTestFailed: 'API detection failed: ',
+      unknownError: 'Unknown error',
+      apiTestError: 'API test failed: ',
+      kvNotConfigured: 'KV storage is not configured, so config management is unavailable.\\n\\nIn Cloudflare Workers:\\n1. Create a KV namespace\\n2. Bind it as environment variable C\\n3. Redeploy the code',
+      kvNotEnabled: 'KV storage not configured',
+      kvCheckFailed: 'KV storage check failed: invalid response format',
+      kvCheckFailedStatus: 'KV storage check failed - status code: ',
+      kvCheckFailedError: 'KV storage check failed - error: '
     }
   };
-  const 翻译值 = 本地值235[是否值236 ? 'fa' : 'zh'];
+  const 翻译值 = 本地值235[语言码236];
   const 值页面 = `<!DOCTYPE html>
-    <html lang="${语言值}" dir="${是否值236 ? 'rtl' : 'ltr'}">
+    <html lang="${语言值}" dir="ltr">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -2002,22 +2062,42 @@ async function 处理订阅值(请求241, 用户240 = null) {
     <body>
         <div class="matrix-bg"></div>
         <div class="matrix-code-rain" id="matrixCodeRain"></div>
+        <header class="sq-topbar">
+          <div class="sq-topbar-in">
+            <span class="sq-brand">CFUSION</span>
+            <div class="cp-lang-wrapper">
+                <span class="cp-lang-tag">LANG_</span>
+                <select id="languageSelector" onchange="切换语言(this.value)">
+                    <option value="zh" ${语言码236 === 'zh' ? 'selected' : ''}>中文</option>
+                    <option value="en" ${语言码236 === 'en' ? 'selected' : ''}>English</option>
+                </select>
+            </div>
+            <button type="button" id="cpFxToggle" class="cp-fx-toggle" onclick="window.切换页面特效()" title="${语言码236 === 'en' ? 'Toggle page effects' : '切换页面特效'}" aria-label="FX toggle">
+                <span class="cp-fx-dot" aria-hidden="true"></span>
+                <span id="cpFxLabel">FX: ON</span>
+            </button>
             <div class="cp-hud">
                 <span class="cp-hud-line"><span class="cp-hud-label">SYS::</span> ${翻译值.terminal}</span>
                 <span class="cp-hud-line"><span class="cp-hud-label">NODE::</span> NIGHT_CITY</span>
                 <span class="cp-hud-line"><span class="cp-hud-label">LINK::</span> SECURE / ENC</span>
             </div>
-            <div class="cp-lang-wrapper">
-                <span class="cp-lang-tag">LANG_</span>
-                <select id="languageSelector" onchange="切换语言(this.value)">
-                    <option value="zh" ${!是否值236 ? 'selected' : ''}>🇨🇳 中文</option>
-                    <option value="fa" ${是否值236 ? 'selected' : ''}>🇮🇷 فارسی</option>
-                </select>
+            <div id="cpActionBar" class="cp-action-bar" role="toolbar" aria-label="${翻译值.configManagement}">
+                <button type="button" id="cpBtnRefresh" class="cp-action-btn" data-tip="${翻译值.refreshConfig}" aria-label="${翻译值.refreshConfig}">
+                    <span aria-hidden="true">↻</span>
+                    <span class="cp-btn-label">${翻译值.refreshConfig}</span>
+                </button>
+                <button type="button" id="cpBtnReset" class="cp-action-btn cp-action-btn-danger" data-tip="${翻译值.resetConfig}" aria-label="${翻译值.resetConfig}">
+                    <span aria-hidden="true">⌫</span>
+                    <span class="cp-btn-label">${翻译值.resetConfig}</span>
+                </button>
+                <button type="button" id="cpBtnSaveAll" class="cp-fab-save" title="${语言码236 === 'en' ? 'Save all settings (Ctrl+S)' : '保存所有配置 (Ctrl+S)'}">
+                    <span class="cp-fab-icon">▣</span>
+                    <span>${语言码236 === 'en' ? 'SAVE ALL' : '保 存 全 部'}</span>
+                    <span class="cp-fab-dot" aria-hidden="true"></span>
+                </button>
             </div>
-            <button type="button" id="cpFxToggle" class="cp-fx-toggle" onclick="window.切换页面特效()" title="${是否值236 ? 'تغییر افکت‌های صفحه' : '切换页面特效'}" aria-label="FX toggle">
-                <span class="cp-fx-dot" aria-hidden="true"></span>
-                <span id="cpFxLabel">FX: ON</span>
-            </button>
+          </div>
+        </header>
         <div class="container">
             <div class="header">
                     <h1 class="title cp-glitch" data-text="${翻译值.title}">${翻译值.title}</h1>
@@ -2038,17 +2118,21 @@ async function 处理订阅值(请求241, 用户240 = null) {
                     <button class="client-btn" onclick="生成客户端链接(atob('djJyYXk='), 'Shadowrocket')">Shadowrocket</button>
                     <button class="client-btn" id="jkClientBtn" style="${启用家宽链式 ? '' : 'display: none;'}" onclick="生成客户端链接('vg', '${翻译值.jkClient}')">${翻译值.jkClient}</button>
                 </div>
-                <div class="subscription-url" id="clientSubscriptionUrl"></div>
+                <div class="sq-subrow" id="clientSubRow" hidden>
+                    <span class="sq-subrow-name" id="clientSubRowName">${语言码236 === 'en' ? 'Subscription link' : '订阅链接'}</span>
+                    <div class="subscription-url" id="clientSubscriptionUrl"></div>
+                    <button type="button" class="sq-copy-btn" id="cpCopySubUrl">${语言码236 === 'en' ? 'Copy' : '复制'}</button>
+                </div>
             </div>
             <div class="card">
                     <h2 class="card-title">${翻译值.systemStatus}</h2>
                 <div id="systemStatus" style="margin: 20px 0; padding: 15px; background: rgba(8, 4, 28, 0.8); border: 2px solid #00f0ff; box-shadow: 0 0 20px rgba(0, 240, 255, 0.3), inset 0 0 15px rgba(0, 240, 255, 0.1); position: relative; overflow: hidden;">
-                        <div style="color: #00f0ff; margin-bottom: 15px; font-weight: bold; text-shadow: 0 0 5px #00f0ff;">[ ${翻译值.checking} ]</div>
+                        <div id="systemStatusHead" data-done="[ ${翻译值.checkDone} ]" style="color: #00f0ff; margin-bottom: 15px; font-weight: bold; text-shadow: 0 0 5px #00f0ff;">[ ${翻译值.checking} ]</div>
                         <div id="regionStatus" style="margin: 8px 0; color: #00f0ff; font-family: 'Courier New', monospace; text-shadow: 0 0 3px #00f0ff;">${翻译值.workerRegion}${翻译值.checking}</div>
                         <div id="geoInfo" style="margin: 8px 0; color: #7aa9c4; font-family: 'Courier New', monospace; font-size: 0.9rem; text-shadow: 0 0 3px #7aa9c4;">${翻译值.detectionMethod}${翻译值.checking}</div>
                         <div id="backupStatus" style="margin: 8px 0; color: #00f0ff; font-family: 'Courier New', monospace; text-shadow: 0 0 3px #00f0ff;">${翻译值.proxyIPStatus}${翻译值.checking}</div>
                         <div id="currentIP" style="margin: 8px 0; color: #00f0ff; font-family: 'Courier New', monospace; text-shadow: 0 0 3px #00f0ff;">${翻译值.currentIP}${翻译值.checking}</div>
-                        <div id="echStatus" style="margin: 8px 0; color: #00f0ff; font-family: 'Courier New', monospace; text-shadow: 0 0 3px #00f0ff; font-size: 0.9rem;">ECH状态: ${翻译值.checking}</div>
+                        <div id="echStatus" style="margin: 8px 0; color: #00f0ff; font-family: 'Courier New', monospace; text-shadow: 0 0 3px #00f0ff; font-size: 0.9rem;">${翻译值.echLabel} ${翻译值.checking}</div>
                         <div id="regionMatch" style="margin: 8px 0; color: #00f0ff; font-family: 'Courier New', monospace; text-shadow: 0 0 3px #00f0ff;">${翻译值.regionMatch}${翻译值.checking}</div>
                         <div id="selectionLogic" style="margin: 8px 0; color: #7aa9c4; font-family: 'Courier New', monospace; font-size: 0.9rem; text-shadow: 0 0 3px #7aa9c4;">${翻译值.selectionLogic}${翻译值.selectionLogicText}</div>
                 </div>
@@ -2075,16 +2159,16 @@ async function 处理订阅值(请求241, 用户240 = null) {
                                     <option value="FI">${翻译值.regionNames.FI}</option>
                                     <option value="GB">${翻译值.regionNames.GB}</option>
                             </select>
-                                <small id="wkRegionHint" style="color: #7aa9c4; font-size: 0.85rem; display: none;">⚠️ ${翻译值.customIPDisabledHint}</small>
+                                <small id="wkRegionHint" style="color: #7aa9c4; font-size: 0.85rem; display: none;">⚠ ${翻译值.customIPDisabledHint}</small>
                         </div>
                     </form>
                     <form id="otherConfigForm" style="margin-bottom: 20px;">
                         <div class="cp-cpu-setting">
                             <label class="cp-cpu-switch" for="freeCpu">
                                 <input type="checkbox" id="freeCpu" aria-describedby="freeCpuHint" ${supportsFreeCpu ? '' : 'disabled'}>
-                                <span>Free CPU 保护</span>
+                                <span>${翻译值.freeCpuLabel}</span>
                             </label>
-                            <small id="freeCpuHint">${supportsFreeCpu ? '单连接上下载合计最多 384 KiB 或 96 个数据块，超过就断开。客户端需自行重连，下载和视频可能中断。保存后对新连接生效，不能保证零超限。' : '当前内核不支持，请先更新配套内核。'}</small>
+                            <small id="freeCpuHint">${supportsFreeCpu ? 翻译值.freeCpuHint : 翻译值.freeCpuUnsupported}</small>
                         </div>
                         <div style="margin-bottom: 15px;">
                                 <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-weight: bold; text-shadow: 0 0 3px #00f0ff;">${翻译值.protocolSelection}</label>
@@ -2154,27 +2238,27 @@ async function 处理订阅值(请求241, 用户240 = null) {
                         </div>
                         <div style="margin-bottom: 15px;">
                                 <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-weight: bold; text-shadow: 0 0 3px #00f0ff;">${翻译值.customPath}</label>
-                                <input type="text" id="customPath" placeholder="${是否值236 ? 'مثال: /mypath یا خالی بگذارید تا از UUID استفاده شود' : '例如: /mypath 或留空使用 UUID'}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 14px;">
-                                <small style="color: #7aa9c4; font-size: 0.85rem;">${是否值236 ? 解码64('2YXYs9uM2LEg2KfYtNiq2LHYp9qpINiz2YHYp9ix2LTbjC4g2Kfar9ixINiu2KfZhNuMINio2q/YsNin2LHbjNivINin2LIgVVVJRCDYqNmHINi52YbZiNin2YYg2YXYs9uM2LEg2KfYs9iq2YHYp9iv2Ycg2YXbjOKAjNi02YjYry4=') : 解码64('6Ieq5a6a5LmJ6K6i6ZiF6Lev5b6E44CC55WZ56m65YiZ5L2/55SoIFVVSUQg5L2c5Li66Lev5b6E44CC')}</small>
+                                <input type="text" id="customPath" placeholder="${语言码236 === 'en' ? 'e.g. /mypath, or leave empty to use the UUID' : '例如: /mypath 或留空使用 UUID'}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 14px;">
+                                <small style="color: #7aa9c4; font-size: 0.85rem;">${语言码236 === 'en' ? 'Custom subscription path. Leave empty to use the UUID as the path.' : 解码64('6Ieq5a6a5LmJ6K6i6ZiF6Lev5b6E44CC55WZ56m65YiZ5L2/55SoIFVVSUQg5L2c5Li66Lev5b6E44CC')}</small>
                         </div>
                         <div style="margin-bottom: 15px;">
                                 <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-weight: bold; text-shadow: 0 0 3px #00f0ff;">${翻译值.customIP}</label>
-                                <input type="text" id="customIP" placeholder="${是否值236 ? 'مثال: 1.2.3.4:443' : '例如: 1.2.3.4:443'}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 14px;">
-                                <small style="color: #7aa9c4; font-size: 0.85rem;">${是否值236 ? 解码64('2KLYr9ix2LMg2Ygg2b7ZiNix2KogUHJveHlJUCDYs9mB2KfYsdi024w=') : 解码64('6Ieq5a6a5LmJUHJveHlJUOWcsOWdgOWSjOerr+WPow==')}</small>
+                                <input type="text" id="customIP" placeholder="${语言码236 === 'en' ? 'e.g. 1.2.3.4:443' : '例如: 1.2.3.4:443'}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 14px;">
+                                <small style="color: #7aa9c4; font-size: 0.85rem;">${语言码236 === 'en' ? 'Custom ProxyIP address and port' : 解码64('6Ieq5a6a5LmJUHJveHlJUOWcsOWdgOWSjOerr+WPow==')}</small>
                         </div>
                         <div style="margin-bottom: 15px;">
                                 <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-weight: bold; text-shadow: 0 0 3px #00f0ff;">${翻译值.preferredIPs}</label>
                                 <textarea id="yx" rows="8" spellcheck="false" placeholder="104.16.1.1:443#日本节点&#10;[2606:4700::1111]:443#IPv6节点&#10;example.com:8443#域名节点" style="width: 100%; min-height: 180px; resize: vertical; line-height: 1.6; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 14px;"></textarea>
-                                <small style="color: #7aa9c4; font-size: 0.85rem;">${是否值236 ? 'فرمت: IP:پورت#نام گره یا IP:پورت (بدون # از نام پیش‌فرض استفاده می‌شود). پشتیبانی از چندین مورد، با خط جدید یا کاما جدا می‌شوند. <span style="color: #ffb400;">IP های اضافه شده از طریق API به طور خودکار در اینجا نمایش داده می‌شوند.</span>' : '格式: IP:端口#节点名称 或 IP:端口 (无#则使用默认名称)。每行一个，也支持英文逗号分隔。<span style="color: #ffb400;">API添加的IP会自动显示在这里。</span>'}</small>
+                                <small style="color: #7aa9c4; font-size: 0.85rem;">${语言码236 === 'en' ? 'Format: IP:port#node-name or IP:port (without #, a default name is used). One per line; comma separation is also supported.<span style="color: #ffb400;">IPs added via the API appear here automatically.</span>' : '格式: IP:端口#节点名称 或 IP:端口 (无#则使用默认名称)。每行一个，也支持英文逗号分隔。<span style="color: #ffb400;">API添加的IP会自动显示在这里。</span>'}</small>
                         </div>
                         <div style="margin-bottom: 15px;">
                                 <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-weight: bold; text-shadow: 0 0 3px #00f0ff;">${翻译值.preferredIPsURL}</label>
-                                <input type="text" id="yxURL" placeholder="${是否值236 ? 'URL منبع لیست IP ترجیحی را وارد کنید' : '输入优选IP列表来源URL'}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 14px;">
-                                <small style="color: #7aa9c4; font-size: 0.85rem;">${是否值236 ? 'URL منبع لیست IP ترجیحی سفارشی، اگر خالی بگذارید از آدرس پیش‌فرض استفاده می‌شود' : '自定义优选IP列表来源URL，留空则使用默认地址'}</small>
+                                <input type="text" id="yxURL" placeholder="${语言码236 === 'en' ? 'Enter the preferred IP list source URL' : '输入优选IP列表来源URL'}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 14px;">
+                                <small style="color: #7aa9c4; font-size: 0.85rem;">${语言码236 === 'en' ? 'Custom preferred IP list source URL. Leave empty to use the default address.' : '自定义优选IP列表来源URL，留空则使用默认地址'}</small>
                         </div>
                         
                         <div style="margin-bottom: 20px; padding: 15px; background: rgba(20, 5, 50, 0.6); border: 2px solid #7aa9c4; border-radius: 8px;">
-                            <h4 style="color: #00f0ff; margin: 0 0 15px 0; font-size: 1.1rem; text-shadow: 0 0 5px #00f0ff;">⚡ ${翻译值.latencyTest}</h4><small style="color:#7aa9c4">检测可用性；延迟按面板服务器位置测得。</small>
+                            <h4 style="color: #00f0ff; margin: 0 0 15px 0; font-size: 1.1rem; text-shadow: 0 0 5px #00f0ff;"><svg class="sq-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 4.8 13.6h5.7L9.3 22l8.2-11.6h-5.7L13 2z"/></svg>${翻译值.latencyTest}</h4><small style="color:#7aa9c4">${翻译值.latencyTestHint}</small>
                             <div style="display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; align-items: center;">
                                 <div style="min-width: 120px;">
                                     <label style="display: block; margin-bottom: 5px; color: #00f0ff; font-size: 0.9rem;">${翻译值.ipSource}</label>
@@ -2193,7 +2277,7 @@ async function 处理订阅值(请求241, 用户240 = null) {
                                     <input type="number" id="randomIPCount" value="20" min="1" max="100" style="width: 100%; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 13px;">
                                 </div>
                                 <div style="width: 80px;">
-                                    <label style="display: block; margin-bottom: 5px; color: #00f0ff; font-size: 0.9rem;">${是否值236 ? 'رشته‌ها' : '线程'}</label>
+                                    <label style="display: block; margin-bottom: 5px; color: #00f0ff; font-size: 0.9rem;">${语言码236 === 'en' ? 'Threads' : '线程'}</label>
                                     <input type="number" id="testThreads" value="5" min="1" max="50" style="width: 100%; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 13px;">
                                 </div>
                             </div>
@@ -2205,11 +2289,11 @@ async function 处理订阅值(请求241, 用户240 = null) {
                                 <label style="display: block; margin-bottom: 5px; color: #00f0ff; font-size: 0.9rem;">${翻译值.fetchURL}</label>
                                 <div style="display: flex; gap: 8px;">
                                     <input type="text" id="fetchURLInput" placeholder="${翻译值.fetchURLPlaceholder}" style="flex: 1; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 13px;">
-                                    <button type="button" id="fetchIPBtn" style="background: rgba(0, 200, 255, 0.2); border: 1px solid #00aaff; padding: 8px 16px; color: #00aaff; font-family: 'Courier New', monospace; cursor: pointer; white-space: nowrap;">⬇ ${翻译值.fetchIP}</button>
+                                    <button type="button" id="fetchIPBtn" style="background: rgba(0, 200, 255, 0.2); border: 1px solid #00aaff; padding: 8px 16px; color: #00aaff; font-family: 'Courier New', monospace; cursor: pointer; white-space: nowrap;">↓ ${翻译值.fetchIP}</button>
                                 </div>
                             </div>
                             <div id="cfRandomDiv" style="margin-bottom: 10px; display: none;">
-                                <button type="button" id="generateCFIPBtn" style="background: rgba(0, 240, 255, 0.15); border: 1px solid #00f0ff; padding: 10px 20px; color: #00f0ff; font-family: 'Courier New', monospace; cursor: pointer; width: 100%; transition: all 0.3s;">🎲 ${翻译值.generateIP}</button>
+                                <button type="button" id="generateCFIPBtn" style="background: rgba(0, 240, 255, 0.15); border: 1px solid #00f0ff; padding: 10px 20px; color: #00f0ff; font-family: 'Courier New', monospace; cursor: pointer; width: 100%; transition: all 0.3s;">${翻译值.generateIP}</button>
                             </div>
                             <div style="display: flex; gap: 10px; margin-bottom: 15px;">
                                 <button type="button" id="startLatencyTest" style="background: rgba(0, 240, 255, 0.2); border: 1px solid #00f0ff; padding: 8px 16px; color: #00f0ff; font-family: 'Courier New', monospace; cursor: pointer; transition: all 0.3s;">▶ ${翻译值.startTest}</button>
@@ -2228,27 +2312,27 @@ async function 处理订阅值(请求241, 用户240 = null) {
                                     <div style="margin-bottom: 8px;">
                                         <label style="display: inline-flex; align-items: center; cursor: pointer; color: #00f0ff; font-size: 0.9rem;">
                                             <input type="radio" name="cityFilterMode" value="all" checked style="margin-right: 6px; width: 16px; height: 16px; cursor: pointer;">
-                                            <span>${是否值236 ? '全部城市' : '全部城市'}</span>
+                                            <span>${语言码236 === 'en' ? 'All cities' : '全部城市'}</span>
                                         </label>
                                         <label style="display: inline-flex; align-items: center; cursor: pointer; color: #00f0ff; font-size: 0.9rem; margin-left: 15px;">
                                             <input type="radio" name="cityFilterMode" value="fastest10" style="margin-right: 6px; width: 16px; height: 16px; cursor: pointer;">
-                                            <span>${是否值236 ? '只选择最快的10个' : '只选择最快的10个'}</span>
+                                            <span>${语言码236 === 'en' ? 'Fastest 10 only' : '只选择最快的10个'}</span>
                                         </label>
                                     </div>
                                     <div id="cityCheckboxesContainer" style="display: flex; flex-wrap: wrap; gap: 8px; max-height: 80px; overflow-y: auto; padding: 5px;"></div>
                                 </div>
                                 <div id="latencyResultsList" style="background: rgba(0, 0, 0, 0.5); border: 1px solid #004400; border-radius: 4px; padding: 10px;"></div>
                                 <div style="margin-top: 10px; display: flex; gap: 10px;">
-                                    <button type="button" id="overwriteSelectedToYx" style="flex: 1; background: rgba(0, 220, 130, 0.3); border: 1px solid #00f0ff; padding: 10px 20px; color: #00f0ff; font-family: 'Courier New', monospace; font-weight: bold; cursor: pointer; transition: all 0.3s;">${是否值236 ? '覆盖添加' : '覆盖添加'}</button>
-                                    <button type="button" id="appendSelectedToYx" style="flex: 1; background: rgba(0, 178, 110, 0.3); border: 1px solid #7aa9c4; padding: 10px 20px; color: #7aa9c4; font-family: 'Courier New', monospace; font-weight: bold; cursor: pointer; transition: all 0.3s;">${是否值236 ? '追加添加' : '追加添加'}</button>
+                                    <button type="button" id="overwriteSelectedToYx" style="flex: 1; background: rgba(0, 220, 130, 0.3); border: 1px solid #00f0ff; padding: 10px 20px; color: #00f0ff; font-family: 'Courier New', monospace; font-weight: bold; cursor: pointer; transition: all 0.3s;">${语言码236 === 'en' ? 'Overwrite & add' : '覆盖添加'}</button>
+                                    <button type="button" id="appendSelectedToYx" style="flex: 1; background: rgba(0, 178, 110, 0.3); border: 1px solid #7aa9c4; padding: 10px 20px; color: #7aa9c4; font-family: 'Courier New', monospace; font-weight: bold; cursor: pointer; transition: all 0.3s;">${语言码236 === 'en' ? 'Append & add' : '追加添加'}</button>
                                 </div>
                             </div>
                         </div>
 
                         <div style="margin-bottom: 15px;">
                                 <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-weight: bold; text-shadow: 0 0 3px #00f0ff;">${翻译值.socks5Config}</label>
-                                <input type="text" id="socksConfig" placeholder="${是否值236 ? 解码64('2YXYq9in2YQ6IHVzZXI6cGFzc0Bob3N0OnBvcnQg24zYpyBodHRwOi8vdXNlcjpwYXNzQGhvc3Q6cG9ydA==') : 解码64('5L6L5aaCOiB1c2VyOnBhc3NAaG9zdDpwb3J0IOaIliBodHRwOi8vdXNlcjpwYXNzQGhvc3Q6cG9ydA==')}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 14px;">
-                                <small style="color: #7aa9c4; font-size: 0.85rem;">${是否值236 ? 解码64('2KLYr9ix2LMg2b7YsdmI2qnYs9uMINiu2LHZiNis24wg2KjYsdin24wg2KfZhtiq2YLYp9mEINiq2YXYp9mFINiq2LHYp9mB24zaqSDYrtix2YjYrNuMLiDYqNiv2YjZhiDZvtuM2LTZiNmG2K8g2KjZhyDYtdmI2LHYqiBzNSDYr9ixINmG2LjYsSDar9ix2YHYqtmHINmF24zigIzYtNmI2K8=') : 解码64('5Ye656uZ5Luj55CG5Zyw5Z2A77yM55So5LqO6L2s5Y+R5omA5pyJ5Ye656uZ5rWB6YeP44CC5LiN5YaZ5YmN57yA6buY6K6k5oyJIHM1IOWkhOeQhg==')}</small>
+                                <input type="text" id="socksConfig" placeholder="${语言码236 === 'en' ? 'e.g. user:pass@host:port or http://user:pass@host:port' : 解码64('5L6L5aaCOiB1c2VyOnBhc3NAaG9zdDpwb3J0IOaIliBodHRwOi8vdXNlcjpwYXNzQGhvc3Q6cG9ydA==')}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 14px;">
+                                <small style="color: #7aa9c4; font-size: 0.85rem;">${语言码236 === 'en' ? 'Outbound proxy address used to forward all outbound traffic. Without a scheme prefix it is treated as SOCKS5.' : 解码64('5Ye656uZ5Luj55CG5Zyw5Z2A77yM55So5LqO6L2s5Y+R5omA5pyJ5Ye656uZ5rWB6YeP44CC5LiN5YaZ5YmN57yA6buY6K6k5oyJIHM1IOWkhOeQhg==')}</small>
                         </div>
                     </form>
 
@@ -2297,13 +2381,18 @@ async function 处理订阅值(请求241, 用户240 = null) {
                                         <span style="font-size: 1.1rem;">${翻译值.jkEnable}</span>
                                 </label>
                                     <small style="color: #7aa9c4; font-size: 0.85rem; display: block; margin-top: 10px;">${翻译值.jkHint}</small>
+                                <div style="margin-top: 12px;">
+                                    <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-weight: bold; text-shadow: 0 0 3px #00f0ff;">${翻译值.jkSourceLabel}</label>
+                                    <input type="text" id="jkSource" placeholder="https://example.com/vpngate-list.txt" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 14px;">
+                                    <small style="color: #7aa9c4; font-size: 0.85rem; display: block; margin-top: 10px;">${翻译值.jkSourceHint}</small>
+                                </div>
                             </div>
                         </div>
                         <div style="margin-bottom: 15px;">
-                                <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-weight: bold; text-shadow: 0 0 3px #00f0ff;">优选IP筛选设置</label>
+                                <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-weight: bold; text-shadow: 0 0 3px #00f0ff;">${翻译值.optFilterTitle}</label>
                             <div style="padding: 15px; background: rgba(15, 3, 40, 0.6); border: 1px solid #00f0ff; border-radius: 5px;">
                                 <div style="margin-bottom: 15px;">
-                                    <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-weight: bold; text-shadow: 0 0 3px #00f0ff;">IP版本选择</label>
+                                    <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-weight: bold; text-shadow: 0 0 3px #00f0ff;">${翻译值.optIpVersion}</label>
                                     <div style="display: flex; gap: 20px; flex-wrap: wrap;">
                                         <label style="display: inline-flex; align-items: center; cursor: pointer; color: #00f0ff;">
                                             <input type="checkbox" id="ipv4Enabled" checked style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
@@ -2316,23 +2405,23 @@ async function 处理订阅值(请求241, 用户240 = null) {
                                     </div>
                                 </div>
                                 <div style="margin-bottom: 10px;">
-                                    <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-weight: bold; text-shadow: 0 0 3px #00f0ff;">运营商选择</label>
+                                    <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-weight: bold; text-shadow: 0 0 3px #00f0ff;">${翻译值.optIsp}</label>
                                     <div style="display: flex; gap: 20px; flex-wrap: wrap;">
                                         <label style="display: inline-flex; align-items: center; cursor: pointer; color: #00f0ff;">
                                             <input type="checkbox" id="ispMobile" checked style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
-                                            <span style="font-size: 1rem;">移动</span>
+                                            <span style="font-size: 1rem;">${翻译值.optIspMobile}</span>
                                         </label>
                                         <label style="display: inline-flex; align-items: center; cursor: pointer; color: #00f0ff;">
                                             <input type="checkbox" id="ispUnicom" checked style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
-                                            <span style="font-size: 1rem;">联通</span>
+                                            <span style="font-size: 1rem;">${翻译值.optIspUnicom}</span>
                                         </label>
                                         <label style="display: inline-flex; align-items: center; cursor: pointer; color: #00f0ff;">
                                             <input type="checkbox" id="ispTelecom" checked style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
-                                            <span style="font-size: 1rem;">电信</span>
+                                            <span style="font-size: 1rem;">${翻译值.optIspTelecom}</span>
                                         </label>
                                     </div>
                                 </div>
-                                    <small style="color: #7aa9c4; font-size: 0.85rem; display: block; margin-top: 10px;">选择要使用的IP版本和运营商，未选中的将被过滤</small>
+                                    <small style="color: #7aa9c4; font-size: 0.85rem; display: block; margin-top: 10px;">${翻译值.optFilterHint}</small>
                             </div>
                         </div>
                         <div style="margin-bottom: 15px;">
@@ -2364,6 +2453,7 @@ async function 处理订阅值(请求241, 用户240 = null) {
                                 <label style="display: block; margin-bottom: 8px; color: #00f0ff; font-weight: bold; text-shadow: 0 0 3px #00f0ff;">${翻译值.tlsControl}</label>
                             <select id="portControl" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #00f0ff; color: #00f0ff; font-family: 'Courier New', monospace; font-size: 14px;">
                                     <option value="">${翻译值.tlsControlDefault}</option>
+                                    <option value="no">${翻译值.tlsControlNo}</option>
                                     <option value="yes">${翻译值.tlsControlYes}</option>
                             </select>
                                 <small style="color: #7aa9c4; font-size: 0.85rem;">${翻译值.tlsControlHint}</small>
@@ -2388,32 +2478,11 @@ async function 处理订阅值(请求241, 用户240 = null) {
                 <div id="statusMessage" style="display: none; padding: 10px; margin: 10px 0; border: 1px solid #00f0ff; background: rgba(8, 4, 28, 0.8); color: #00f0ff; text-shadow: 0 0 5px #00f0ff;"></div>
             </div>
             
-            <div class="card">
-                    <h2 class="card-title">${翻译值.relatedLinks}</h2>
-                <div style="text-align: center; margin: 20px 0;">
-                        <a href="https://github.com/byJoey/cfnew" target="_blank" style="color: #00f0ff; text-decoration: none; margin: 0 20px; font-size: 1.2rem; text-shadow: 0 0 5px #00f0ff;">${翻译值.githubProject}</a>
-                        <a href="https://github.com/byJoey/yx-tools/releases/" target="_blank" rel="noopener noreferrer" style="color: #00f0ff; text-decoration: none; margin: 0 20px; font-size: 1.2rem; text-shadow: 0 0 5px #00f0ff;">${翻译值.优选工具}</a>
-                    <a href="https://www.youtube.com/@joeyblog" target="_blank" style="color: #00f0ff; text-decoration: none; margin: 0 20px; font-size: 1.2rem; text-shadow: 0 0 5px #00f0ff;">YouTube @joeyblog</a>
-                </div>
             </div>
+            <footer class="sq-footer">CFUSION · ${翻译值.title} · ${new Date().getFullYear()}</footer>
         </div>
         <div id="cpToastStack" class="cp-toast-stack" aria-live="polite" aria-atomic="false"></div>
         <div id="cpActionStatus" class="cp-action-status" role="status" aria-live="polite"></div>
-        <div id="cpActionBar" class="cp-action-bar" role="toolbar" aria-label="${翻译值.configManagement}">
-            <button type="button" id="cpBtnSaveAll" class="cp-fab-save" title="${是否值236 ? 'ذخیره همه تنظیمات' : '保存所有配置 (Ctrl+S)'}">
-                <span class="cp-fab-icon">▣</span>
-                <span>${是否值236 ? 'ذخیره همه' : '保 存 全 部'}</span>
-                <span class="cp-fab-dot" aria-hidden="true"></span>
-            </button>
-            <button type="button" id="cpBtnRefresh" class="cp-action-btn" data-tip="${翻译值.refreshConfig}" aria-label="${翻译值.refreshConfig}">
-                <span aria-hidden="true">↻</span>
-                <span class="cp-btn-label">${翻译值.refreshConfig}</span>
-            </button>
-            <button type="button" id="cpBtnReset" class="cp-action-btn cp-action-btn-danger" data-tip="${翻译值.resetConfig}" aria-label="${翻译值.resetConfig}">
-                <span aria-hidden="true">⌫</span>
-                <span class="cp-btn-label">${翻译值.resetConfig}</span>
-            </button>
-        </div>
         <script>
 // 地址从服务器配置注入
 var 订阅转换网址 = ${JSON.stringify(订阅转换接口).replaceAll("<", "\\u003c")};
@@ -2426,9 +2495,9 @@ const 本地值20215 = {
     subscriptionCopied: '${解码64('6K6i6ZiF6ZO+5o6l5bey5aSN5Yi2')}',
     autoSubscriptionCopied: '${解码64('6Ieq5Yqo6K+G5Yir6K6i6ZiF6ZO+5o6l5bey5aSN5Yi277yM5a6i5oi356uv6K6/6Zeu5pe25Lya5qC55o2uVXNlci1BZ2VudOiHquWKqOivhuWIq+W5tui/lOWbnuWvueW6lOagvOW8jw==')}'
   },
-  fa: {
-    subscriptionCopied: 'لینک اشتراک کپی شد',
-    autoSubscriptionCopied: 'لینک اشتراک تشخیص خودکار کپی شد، کلاینت هنگام دسترسی بر اساس User-Agent به طور خودکار تشخیص داده و قالب مربوطه را برمی‌گرداند'
+en: {
+    subscriptionCopied: 'Subscription link copied',
+    autoSubscriptionCopied: 'Auto-detect subscription link copied. When a client fetches it, the format is selected automatically from the User-Agent.'
   }
 };
 async function 请求优选操作(动作, 数据, 信号) {
@@ -2445,15 +2514,13 @@ function 获取凭据20214(名称20213) {
 }
 const 浏览器语言20210 = navigator.language || navigator.userLanguage || '';
 const 已保存语言20209 = localStorage.getItem('preferredLanguage') || 获取凭据20214('preferredLanguage');
-let 是否值20208 = false;
-if (已保存语言20209 === 'fa' || 已保存语言20209 === 'fa-IR') {
-  是否值20208 = true;
-} else if (已保存语言20209 === 'zh' || 已保存语言20209 === 'zh-CN') {
-  是否值20208 = false;
-} else {
-  是否值20208 = 浏览器语言20210.includes('fa') || 浏览器语言20210.includes('fa-IR');
+let 语言码20208 = 'zh';
+if (已保存语言20209 === 'en' || 已保存语言20209 === 'en-US' || 已保存语言20209 === 'en-GB') {
+  语言码20208 = 'en';
+} else if (!已保存语言20209) {
+  语言码20208 = 浏览器语言20210.toLowerCase().startsWith('en') ? 'en' : 'zh';
 }
-const 翻译值20207 = 本地值20215[是否值20208 ? 'fa' : 'zh'];
+const 翻译值20207 = 本地值20215[语言码20208];
 function 切换语言(语言) {
   localStorage.setItem('preferredLanguage', 语言);
   // 设置Cookie（有效期1年）
@@ -2599,6 +2666,25 @@ function 尝试打开应用(方案网址20197, 回退回调, 超时20196) {
     }
   }, 超时20196);
 }
+function 显示订阅行(名称) {
+  var 行元素 = document.getElementById("clientSubRow");
+  if (!行元素) return;
+  行元素.hidden = false;
+  var 名元素 = document.getElementById("clientSubRowName");
+  if (名元素 && 名称) 名元素.textContent = 名称;
+}
+(function () {
+  var 复制按钮 = document.getElementById('cpCopySubUrl');
+  if (!复制按钮) return;
+  复制按钮.addEventListener('click', function () {
+    var 目标 = document.getElementById('clientSubscriptionUrl');
+    var 文本 = 目标 ? 目标.textContent.trim() : '';
+    if (!文本) return;
+    navigator.clipboard.writeText(文本).then(function () {
+      显示提示(翻译值20207.subscriptionCopied, 'success');
+    });
+  });
+})();
 function 生成客户端链接(客户端类型, 客户端名称) {
   var 当前网址20192 = window.location.href;
   var 订阅网址20191 = window.CFNEW.subUrl;
@@ -2615,6 +2701,7 @@ function 生成客户端链接(客户端类型, 客户端名称) {
     网址值20190.style.overflowX = "auto";
     网址值20190.style.maxWidth = "100%";
     网址值20190.style.boxSizing = "border-box";
+    显示订阅行(显示名称);
     if (客户端名称 === 'V2RAY') {
       navigator.clipboard.writeText(最终网址).then(function () {
         显示提示(显示名称 + " " + 翻译值20207.subscriptionCopied, 'success');
@@ -2652,6 +2739,7 @@ function 生成客户端链接(客户端类型, 客户端名称) {
     网址值20190.style.overflowX = "auto";
     网址值20190.style.maxWidth = "100%";
     网址值20190.style.boxSizing = "border-box";
+    显示订阅行(显示名称);
     if (客户端类型 === 'vg') {
       方案网址 = '${解码64('Y2xhc2g6Ly9pbnN0YWxsLWNvbmZpZz91cmw9')}' + encodeURIComponent(最终网址);
     } else if (客户端类型 === atob('Y2xhc2g=')) {
@@ -2763,6 +2851,8 @@ function 创建矩阵雨() {
   }, 110);
 }
 async function 检查系统状态() {
+  const 状态标题 = document.getElementById('systemStatusHead');
+  const 标记检测完成 = () => { if (状态标题 && 状态标题.dataset.done) 状态标题.textContent = 状态标题.dataset.done; };
   try {
     const 云墙状态 = document.getElementById('cfStatus');
     const 地区状态 = document.getElementById('regionStatus');
@@ -2780,13 +2870,11 @@ async function 检查系统状态() {
     }
     const 浏览器语言20174 = navigator.language || navigator.userLanguage || '';
     const 已保存语言20173 = localStorage.getItem('preferredLanguage') || 获取凭据20178('preferredLanguage');
-    let 是否值20172 = false;
-    if (已保存语言20173 === 'fa' || 已保存语言20173 === 'fa-IR') {
-      是否值20172 = true;
-    } else if (已保存语言20173 === 'zh' || 已保存语言20173 === 'zh-CN') {
-      是否值20172 = false;
-    } else {
-      是否值20172 = 浏览器语言20174.includes('fa') || 浏览器语言20174.includes('fa-IR');
+    let 语言码20172 = 'zh';
+    if (已保存语言20173 === 'en' || 已保存语言20173 === 'en-US' || 已保存语言20173 === 'en-GB') {
+      语言码20172 = 'en';
+    } else if (!已保存语言20173) {
+      语言码20172 = 浏览器语言20174.toLowerCase().startsWith('en') ? 'en' : 'zh';
     }
     const 本地值20171 = {
       zh: {
@@ -2822,41 +2910,41 @@ async function 检查系统状态() {
         detectionFailed: '检测失败',
         unknown: '未知'
       },
-      fa: {
-        workerRegion: 'منطقه Worker: ',
-        detectionMethod: 'روش تشخیص: ',
-        proxyIPStatus: '${解码64('2YjYtti524zYqiBQcm94eUlQOiA=')}',
-        currentIP: 'IP فعلی: ',
-        regionMatch: 'تطبیق منطقه: ',
+en: {
+        workerRegion: 'Worker region: ',
+        detectionMethod: 'Detection method: ',
+        proxyIPStatus: 'ProxyIP status: ',
+        currentIP: 'Current IP: ',
+        regionMatch: 'Region match: ',
         regionNames: {
-          'CF': '🌐 مستقیم رسمی',
-          'HK': '🇭🇰 هنگ کنگ',
-          'US': '🇺🇸 آمریکا',
-          'SG': '🇸🇬 سنگاپور',
-          'JP': '🇯🇵 ژاپن',
-          'KR': '🇰🇷 کره جنوبی',
-          'DE': '🇩🇪 آلمان',
-          'SE': '🇸🇪 سوئد',
-          'NL': '🇳🇱 هلند',
-          'FI': '🇫🇮 فنلاند',
-          'GB': '🇬🇧 بریتانیا'
+          CF: '🌐 Official direct',
+          HK: '🇭🇰 Hong Kong',
+          US: '🇺🇸 United States',
+          SG: '🇸🇬 Singapore',
+          JP: '🇯🇵 Japan',
+          KR: '🇰🇷 South Korea',
+          DE: '🇩🇪 Germany',
+          SE: '🇸🇪 Sweden',
+          NL: '🇳🇱 Netherlands',
+          FI: '🇫🇮 Finland',
+          GB: '🇬🇧 United Kingdom'
         },
-        customIPMode: '${解码64('2K3Yp9mE2KogUHJveHlJUCDYs9mB2KfYsdi024wgKNmF2KrYutuM2LEgcCDZgdi52KfZhCDYp9iz2Kop')}',
-        customIPModeDesc: 'حالت IP سفارشی (تطبیق منطقه غیرفعال است)',
-        usingCustomProxyIP: '${解码64('2KfYs9iq2YHYp9iv2Ycg2KfYsiBQcm94eUlQINiz2YHYp9ix2LTbjDog')}',
-        customIPConfig: ' (پیکربندی متغیر p)',
-        customIPModeDisabled: 'حالت IP سفارشی، انتخاب منطقه غیرفعال است',
-        manualRegion: 'تعیین منطقه دستی',
-        manualRegionDesc: ' (تعیین دستی)',
-        proxyIPAvailable: '${解码64('MTAvMTAg2K/YsSDYr9iz2KrYsdizICjYr9in2YXZhtmHINm+24zYtOKAjNmB2LHYtiBQcm94eUlQINiv2LEg2K/Ys9iq2LHYsyDYp9iz2Kop')}',
-        smartSelection: 'انتخاب هوشمند نزدیک در حال انجام است',
-        sameRegionIP: 'IP هم‌منطقه در دسترس است (1)',
-        cloudflareDetection: 'اتصال مستقیم رسمی',
-        detectionFailed: 'تشخیص ناموفق',
-        unknown: 'ناشناخته'
+        customIPMode: 'Custom ProxyIP mode (p variable enabled)',
+        customIPModeDesc: 'Custom IP mode (region matching disabled)',
+        usingCustomProxyIP: 'Using custom ProxyIP: ',
+        customIPConfig: ' (p variable config)',
+        customIPModeDisabled: 'Custom IP mode, region selection disabled',
+        manualRegion: 'Manually specified region',
+        manualRegionDesc: ' (manual)',
+        proxyIPAvailable: '10/10 available (preset ProxyIP domains usable)',
+        smartSelection: 'Smart nearby selection in progress',
+        sameRegionIP: 'Same-region IP available (1)',
+        cloudflareDetection: 'Official direct',
+        detectionFailed: 'Detection failed',
+        unknown: 'Unknown'
       }
     };
-    const 翻译值20170 = 本地值20171[是否值20172 ? 'fa' : 'zh'];
+    const 翻译值20170 = 本地值20171[语言码20172];
     let 值地区20169 = 'US'; // 默认值
     let 是否自定义地址值 = false;
     let 是否手动地区值 = false;
@@ -2869,24 +2957,26 @@ async function 检查系统状态() {
 
         // 获取自定义IP的详细信息
         const 自定义地址值 = 数据20167.ci || 翻译值20170.unknown;
-        值值20179.innerHTML = 翻译值20170.detectionMethod + '<span style="color: #ffb400;">⚙️ ' + 翻译值20170.customIPMode + '</span>';
-        地区状态.innerHTML = 翻译值20170.workerRegion + '<span style="color: #ffb400;">🔧 ' + 翻译值20170.customIPModeDesc + '</span>';
+        值值20179.innerHTML = 翻译值20170.detectionMethod + '<span style="color: #ffb400;">⚙ ' + 翻译值20170.customIPMode + '</span>';
+        地区状态.innerHTML = 翻译值20170.workerRegion + '<span style="color: #ffb400;">⚙ ' + 翻译值20170.customIPModeDesc + '</span>';
 
         // 显示自定义IP配置状态，包含具体IP
-        if (备用状态) 备用状态.innerHTML = 翻译值20170.proxyIPStatus + '<span style="color: #ffb400;">🔧 ' + 翻译值20170.usingCustomProxyIP + 自定义地址值 + '</span>';
-        if (当前地址) 当前地址.innerHTML = 翻译值20170.currentIP + '<span style="color: #ffb400;">✅ ' + 自定义地址值 + 翻译值20170.customIPConfig + '</span>';
-        if (地区值) 地区值.innerHTML = 翻译值20170.regionMatch + '<span style="color: #ffb400;">⚠️ ' + 翻译值20170.customIPModeDisabled + '</span>';
+        if (备用状态) 备用状态.innerHTML = 翻译值20170.proxyIPStatus + '<span style="color: #ffb400;">⚙ ' + 翻译值20170.usingCustomProxyIP + 自定义地址值 + '</span>';
+        if (当前地址) 当前地址.innerHTML = 翻译值20170.currentIP + '<span style="color: #ffb400;">✓ ' + 自定义地址值 + 翻译值20170.customIPConfig + '</span>';
+        if (地区值) 地区值.innerHTML = 翻译值20170.regionMatch + '<span style="color: #ffb400;">⚠ ' + 翻译值20170.customIPModeDisabled + '</span>';
+        标记检测完成();
         return; // 提前返回，不执行后续的地区匹配逻辑
-      } else if (数据20167.detectionMethod === '手动指定地区' || 数据20167.detectionMethod === 'تعیین منطقه دستی') {
+      } else if (数据20167.detectionMethod === '手动指定地区') {
         是否手动地区值 = true;
         值地区20169 = 数据20167.region;
         值值20179.innerHTML = 翻译值20170.detectionMethod + '<span style="color: #00b380;">' + 翻译值20170.manualRegion + '</span>';
-        地区状态.innerHTML = 翻译值20170.workerRegion + '<span style="color: #00ff9d;">🎯 ' + 翻译值20170.regionNames[值地区20169] + 翻译值20170.manualRegionDesc + '</span>';
+        地区状态.innerHTML = 翻译值20170.workerRegion + '<span style="color: #00ff9d;">◎ ' + 翻译值20170.regionNames[值地区20169] + 翻译值20170.manualRegionDesc + '</span>';
 
         // 显示配置状态而不是检测状态
-        if (备用状态) 备用状态.innerHTML = 翻译值20170.proxyIPStatus + '<span style="color: #00ff9d;">✅ ' + 翻译值20170.proxyIPAvailable + '</span>';
-        if (当前地址) 当前地址.innerHTML = 翻译值20170.currentIP + '<span style="color: #00ff9d;">✅ ' + 翻译值20170.smartSelection + '</span>';
-        if (地区值) 地区值.innerHTML = 翻译值20170.regionMatch + '<span style="color: #00ff9d;">✅ ' + 翻译值20170.sameRegionIP + '</span>';
+        if (备用状态) 备用状态.innerHTML = 翻译值20170.proxyIPStatus + '<span style="color: #00ff9d;">✓ ' + 翻译值20170.proxyIPAvailable + '</span>';
+        if (当前地址) 当前地址.innerHTML = 翻译值20170.currentIP + '<span style="color: #00ff9d;">✓ ' + 翻译值20170.smartSelection + '</span>';
+        if (地区值) 地区值.innerHTML = 翻译值20170.regionMatch + '<span style="color: #00ff9d;">✓ ' + 翻译值20170.sameRegionIP + '</span>';
+        标记检测完成();
         return; // 提前返回，不执行后续的地区匹配逻辑
       } else if (数据20167.region && 翻译值20170.regionNames[数据20167.region]) {
         值地区20169 = 数据20167.region;
@@ -2895,18 +2985,19 @@ async function 检查系统状态() {
     } catch (事件值20166) {
       值值20179.innerHTML = 翻译值20170.detectionMethod + '<span style="color: #ff3860;">' + 翻译值20170.detectionFailed + '</span>';
     }
-    地区状态.innerHTML = 翻译值20170.workerRegion + '<span style="color: #00ff9d;">✅ ' + 翻译值20170.regionNames[值地区20169] + '</span>';
+    地区状态.innerHTML = 翻译值20170.workerRegion + '<span style="color: #00ff9d;">✓ ' + 翻译值20170.regionNames[值地区20169] + '</span>';
 
     // 直接显示配置状态，不再进行检测
     if (备用状态) {
-      备用状态.innerHTML = 翻译值20170.proxyIPStatus + '<span style="color: #00ff9d;">✅ ' + 翻译值20170.proxyIPAvailable + '</span>';
+      备用状态.innerHTML = 翻译值20170.proxyIPStatus + '<span style="color: #00ff9d;">✓ ' + 翻译值20170.proxyIPAvailable + '</span>';
     }
     if (当前地址) {
-      当前地址.innerHTML = 翻译值20170.currentIP + '<span style="color: #00ff9d;">✅ ' + 翻译值20170.smartSelection + '</span>';
+      当前地址.innerHTML = 翻译值20170.currentIP + '<span style="color: #00ff9d;">✓ ' + 翻译值20170.smartSelection + '</span>';
     }
     if (地区值) {
-      地区值.innerHTML = 翻译值20170.regionMatch + '<span style="color: #00ff9d;">✅ ' + 翻译值20170.sameRegionIP + '</span>';
+      地区值.innerHTML = 翻译值20170.regionMatch + '<span style="color: #00ff9d;">✓ ' + 翻译值20170.sameRegionIP + '</span>';
     }
+    标记检测完成();
   } catch (错误20165) {
     function 获取凭据20164(名称20163) {
       const 值20162 = '; ' + document.cookie;
@@ -2916,11 +3007,11 @@ async function 检查系统状态() {
     }
     const 浏览器语言20160 = navigator.language || navigator.userLanguage || '';
     const 已保存语言20159 = localStorage.getItem('preferredLanguage') || 获取凭据20164('preferredLanguage');
-    let 是否值20158 = false;
-    if (已保存语言20159 === 'fa' || 已保存语言20159 === 'fa-IR') {
-      是否值20158 = true;
-    } else {
-      是否值20158 = 浏览器语言20160.includes('fa') || 浏览器语言20160.includes('fa-IR');
+    let 语言码20158 = 'zh';
+    if (已保存语言20159 === 'en' || 已保存语言20159 === 'en-US' || 已保存语言20159 === 'en-GB') {
+      语言码20158 = 'en';
+    } else if (!已保存语言20159) {
+      语言码20158 = 浏览器语言20160.toLowerCase().startsWith('en') ? 'en' : 'zh';
     }
     const 本地值20157 = {
       zh: {
@@ -2931,21 +3022,22 @@ async function 检查系统状态() {
         regionMatch: '地区匹配: ',
         detectionFailed: '检测失败'
       },
-      fa: {
-        workerRegion: 'منطقه Worker: ',
-        detectionMethod: 'روش تشخیص: ',
-        proxyIPStatus: '${解码64('2YjYtti524zYqiBQcm94eUlQOiA=')}',
-        currentIP: 'IP فعلی: ',
-        regionMatch: 'تطبیق منطقه: ',
-        detectionFailed: 'تشخیص ناموفق'
+en: {
+        workerRegion: 'Worker region: ',
+        detectionMethod: 'Detection method: ',
+        proxyIPStatus: 'ProxyIP status: ',
+        currentIP: 'Current IP: ',
+        regionMatch: 'Region match: ',
+        detectionFailed: 'Detection failed'
       }
     };
-    const 翻译值20156 = 本地值20157[是否值20158 ? 'fa' : 'zh'];
-    document.getElementById('regionStatus').innerHTML = 翻译值20156.workerRegion + '<span style="color: #ff3860;">❌ ' + 翻译值20156.detectionFailed + '</span>';
-    document.getElementById('geoInfo').innerHTML = 翻译值20156.detectionMethod + '<span style="color: #ff3860;">❌ ' + 翻译值20156.detectionFailed + '</span>';
-    document.getElementById('backupStatus').innerHTML = 翻译值20156.proxyIPStatus + '<span style="color: #ff3860;">❌ ' + 翻译值20156.detectionFailed + '</span>';
-    document.getElementById('currentIP').innerHTML = 翻译值20156.currentIP + '<span style="color: #ff3860;">❌ ' + 翻译值20156.detectionFailed + '</span>';
-    document.getElementById('regionMatch').innerHTML = 翻译值20156.regionMatch + '<span style="color: #ff3860;">❌ ' + 翻译值20156.detectionFailed + '</span>';
+    const 翻译值20156 = 本地值20157[语言码20158];
+    document.getElementById('regionStatus').innerHTML = 翻译值20156.workerRegion + '<span style="color: #ff3860;">✕ ' + 翻译值20156.detectionFailed + '</span>';
+    document.getElementById('geoInfo').innerHTML = 翻译值20156.detectionMethod + '<span style="color: #ff3860;">✕ ' + 翻译值20156.detectionFailed + '</span>';
+    document.getElementById('backupStatus').innerHTML = 翻译值20156.proxyIPStatus + '<span style="color: #ff3860;">✕ ' + 翻译值20156.detectionFailed + '</span>';
+    document.getElementById('currentIP').innerHTML = 翻译值20156.currentIP + '<span style="color: #ff3860;">✕ ' + 翻译值20156.detectionFailed + '</span>';
+    document.getElementById('regionMatch').innerHTML = 翻译值20156.regionMatch + '<span style="color: #ff3860;">✕ ' + 翻译值20156.detectionFailed + '</span>';
+    标记检测完成();
   }
 }
 async function 测试接口() {
@@ -2958,11 +3050,11 @@ async function 测试接口() {
     }
     const 浏览器语言20151 = navigator.language || navigator.userLanguage || '';
     const 已保存语言20150 = localStorage.getItem('preferredLanguage') || 获取凭据20155('preferredLanguage');
-    let 是否值20149 = false;
-    if (已保存语言20150 === 'fa' || 已保存语言20150 === 'fa-IR') {
-      是否值20149 = true;
-    } else {
-      是否值20149 = 浏览器语言20151.includes('fa') || 浏览器语言20151.includes('fa-IR');
+    let 语言码20149 = 'zh';
+    if (已保存语言20150 === 'en' || 已保存语言20150 === 'en-US' || 已保存语言20150 === 'en-GB') {
+      语言码20149 = 'en';
+    } else if (!已保存语言20150) {
+      语言码20149 = 浏览器语言20151.toLowerCase().startsWith('en') ? 'en' : 'zh';
     }
     const 本地值20148 = {
       zh: {
@@ -2972,15 +3064,15 @@ async function 测试接口() {
         unknownError: '未知错误',
         apiTestError: 'API测试失败: '
       },
-      fa: {
-        apiTestResult: 'نتیجه تشخیص API: ',
-        apiTestTime: 'زمان تشخیص: ',
-        apiTestFailed: 'تشخیص API ناموفق: ',
-        unknownError: 'خطای ناشناخته',
-        apiTestError: 'تست API ناموفق: '
+en: {
+        apiTestResult: 'API test result: ',
+        apiTestTime: 'Test time: ',
+        apiTestFailed: 'API detection failed: ',
+        unknownError: 'Unknown error',
+        apiTestError: 'API test failed: '
       }
     };
-    const 翻译值20147 = 本地值20148[是否值20149 ? 'fa' : 'zh'];
+    const 翻译值20147 = 本地值20148[语言码20149];
     const 响应20146 = await fetch(window.CFNEW.apiBase + '/test-api');
     const 数据20145 = await 响应20146.json();
     if (数据20145.detectedRegion) {
@@ -3001,21 +3093,21 @@ async function 测试接口() {
     }
     const 浏览器语言20139 = navigator.language || navigator.userLanguage || '';
     const 已保存语言20138 = localStorage.getItem('preferredLanguage') || 获取凭据20143('preferredLanguage');
-    let 是否值20137 = false;
-    if (已保存语言20138 === 'fa' || 已保存语言20138 === 'fa-IR') {
-      是否值20137 = true;
-    } else {
-      是否值20137 = 浏览器语言20139.includes('fa') || 浏览器语言20139.includes('fa-IR');
+    let 语言码20137 = 'zh';
+    if (已保存语言20138 === 'en' || 已保存语言20138 === 'en-US' || 已保存语言20138 === 'en-GB') {
+      语言码20137 = 'en';
+    } else if (!已保存语言20138) {
+      语言码20137 = 浏览器语言20139.toLowerCase().startsWith('en') ? 'en' : 'zh';
     }
     const 本地值20136 = {
       zh: {
         apiTestError: 'API测试失败: '
       },
-      fa: {
-        apiTestError: 'تست API ناموفق: '
+en: {
+        apiTestError: 'API test failed: '
       }
     };
-    const 翻译值20135 = 本地值20136[是否值20137 ? 'fa' : 'zh'];
+    const 翻译值20135 = 本地值20136[语言码20137];
     显示提示(翻译值20135.apiTestError + 错误20144.message, 'error', {
       duration: 4500
     });
@@ -3035,39 +3127,39 @@ async function 检查键值状态() {
     }
     const 浏览器语言20128 = navigator.language || navigator.userLanguage || '';
     const 已保存语言20127 = localStorage.getItem('preferredLanguage') || 获取凭据20132('preferredLanguage');
-    let 是否值20126 = false;
-    if (已保存语言20127 === 'fa' || 已保存语言20127 === 'fa-IR') {
-      是否值20126 = true;
-    } else {
-      是否值20126 = 浏览器语言20128.includes('fa') || 浏览器语言20128.includes('fa-IR');
+    let 语言码20126 = 'zh';
+    if (已保存语言20127 === 'en' || 已保存语言20127 === 'en-US' || 已保存语言20127 === 'en-GB') {
+      语言码20126 = 'en';
+    } else if (!已保存语言20127) {
+      语言码20126 = 浏览器语言20128.toLowerCase().startsWith('en') ? 'en' : 'zh';
     }
     const 本地值20125 = {
       zh: {
-        kvDisabled: '⚠️ KV存储未启用或未配置',
+        kvDisabled: '⚠ KV存储未启用或未配置',
         kvNotConfigured: 'KV存储未配置，无法使用配置管理功能。\\n\\n请在Cloudflare Workers中:\\n1. 创建KV命名空间\\n2. 绑定环境变量 C\\n3. 重新部署代码',
         kvNotEnabled: 'KV存储未配置',
-        kvEnabled: '✅ KV存储已启用，可以使用配置管理功能',
-        kvCheckFailed: '⚠️ KV存储检测失败',
+        kvEnabled: '✓ KV存储已启用，可以使用配置管理功能',
+        kvCheckFailed: '⚠ KV存储检测失败',
         kvCheckFailedFormat: 'KV存储检测失败: 响应格式错误',
         kvCheckFailedStatus: 'KV存储检测失败 - 状态码: ',
         kvCheckFailedError: 'KV存储检测失败 - 错误: '
       },
-      fa: {
-        kvDisabled: '⚠️ ذخیره‌سازی KV فعال نیست یا پیکربندی نشده است',
-        kvNotConfigured: 'ذخیره‌سازی KV پیکربندی نشده است، نمی‌توانید از عملکرد مدیریت تنظیمات استفاده کنید.\\n\\nلطفا در Cloudflare Workers:\\n1. فضای نام KV ایجاد کنید\\n2. متغیر محیطی C را پیوند دهید\\n3. کد را دوباره مستقر کنید',
-        kvNotEnabled: 'ذخیره‌سازی KV پیکربندی نشده است',
-        kvEnabled: '✅ ذخیره‌سازی KV فعال است، می‌توانید از مدیریت تنظیمات استفاده کنید',
-        kvCheckFailed: '⚠️ بررسی ذخیره‌سازی KV ناموفق',
-        kvCheckFailedFormat: 'بررسی ذخیره‌سازی KV ناموفق: خطای فرمت پاسخ',
-        kvCheckFailedStatus: 'بررسی ذخیره‌سازی KV ناموفق - کد وضعیت: ',
-        kvCheckFailedError: 'بررسی ذخیره‌سازی KV ناموفق - خطا: '
+en: {
+        kvDisabled: '⚠ KV storage is not enabled or not configured',
+        kvNotConfigured: 'KV storage is not configured, so config management is unavailable.\\n\\nIn Cloudflare Workers:\\n1. Create a KV namespace\\n2. Bind it as environment variable C\\n3. Redeploy the code',
+        kvNotEnabled: 'KV storage not configured',
+        kvEnabled: '✓ KV storage is enabled. Config management is available.',
+        kvCheckFailed: '⚠ KV storage check failed',
+        kvCheckFailedFormat: 'KV storage check failed: invalid response format',
+        kvCheckFailedStatus: 'KV storage check failed - status code: ',
+        kvCheckFailedError: 'KV storage check failed - error: '
       }
     };
-    const 翻译值20124 = 本地值20125[是否值20126 ? 'fa' : 'zh'];
+    const 翻译值20124 = 本地值20125[语言码20126];
     if (响应20133.status === 503) {
       // KV未配置
       document.getElementById('kvStatus').innerHTML = '<span style="color: #ffb400;">' + 翻译值20124.kvDisabled + '</span>';
-      document.getElementById('configCard').style.display = 'block';
+      document.getElementById('configCard').style.display = '';
       document.getElementById('currentConfig').textContent = 翻译值20124.kvNotConfigured;
     } else if (响应20133.ok) {
       try {
@@ -3077,21 +3169,21 @@ async function 检查键值状态() {
         if (数据20123 && 数据20123.kvEnabled === true) {
           document.getElementById('kvStatus').innerHTML = '<span style="color: #00ff9d;">' + 翻译值20124.kvEnabled + '</span>';
           document.getElementById('configContent').style.display = 'block';
-          document.getElementById('configCard').style.display = 'block';
+          document.getElementById('configCard').style.display = '';
           await 加载当前配置();
         } else {
           document.getElementById('kvStatus').innerHTML = '<span style="color: #ffb400;">' + 翻译值20124.kvDisabled + '</span>';
-          document.getElementById('configCard').style.display = 'block';
+          document.getElementById('configCard').style.display = '';
           document.getElementById('currentConfig').textContent = 翻译值20124.kvNotEnabled;
         }
       } catch (数据对象错误) {
         document.getElementById('kvStatus').innerHTML = '<span style="color: #ffb400;">' + 翻译值20124.kvCheckFailed + '</span>';
-        document.getElementById('configCard').style.display = 'block';
+        document.getElementById('configCard').style.display = '';
         document.getElementById('currentConfig').textContent = 翻译值20124.kvCheckFailedFormat;
       }
     } else {
       document.getElementById('kvStatus').innerHTML = '<span style="color: #ffb400;">' + 翻译值20124.kvDisabled + '</span>';
-      document.getElementById('configCard').style.display = 'block';
+      document.getElementById('configCard').style.display = '';
       document.getElementById('currentConfig').textContent = 翻译值20124.kvCheckFailedStatus + 响应20133.status;
     }
   } catch (错误20122) {
@@ -3103,25 +3195,25 @@ async function 检查键值状态() {
     }
     const 浏览器语言 = navigator.language || navigator.userLanguage || '';
     const 已保存语言 = localStorage.getItem('preferredLanguage') || 获取凭据('preferredLanguage');
-    let 是否值 = false;
-    if (已保存语言 === 'fa' || 已保存语言 === 'fa-IR') {
-      是否值 = true;
-    } else {
-      是否值 = 浏览器语言.includes('fa') || 浏览器语言.includes('fa-IR');
+    let 语言码 = 'zh';
+    if (已保存语言 === 'en' || 已保存语言 === 'en-US' || 已保存语言 === 'en-GB') {
+      语言码 = 'en';
+    } else if (!已保存语言) {
+      语言码 = 浏览器语言.toLowerCase().startsWith('en') ? 'en' : 'zh';
     }
     const 本地值20119 = {
       zh: {
-        kvDisabled: '⚠️ KV存储未启用或未配置',
+        kvDisabled: '⚠ KV存储未启用或未配置',
         kvCheckFailedError: 'KV存储检测失败 - 错误: '
       },
-      fa: {
-        kvDisabled: '⚠️ ذخیره‌سازی KV فعال نیست یا پیکربندی نشده است',
-        kvCheckFailedError: 'بررسی ذخیره‌سازی KV ناموفق - خطا: '
+en: {
+        kvDisabled: '⚠ KV storage is not enabled or not configured',
+        kvCheckFailedError: 'KV storage check failed - error: '
       }
     };
-    const 翻译值20118 = 本地值20119[是否值 ? 'fa' : 'zh'];
+    const 翻译值20118 = 本地值20119[语言码];
     document.getElementById('kvStatus').innerHTML = '<span style="color: #ffb400;">' + 翻译值20118.kvDisabled + '</span>';
-    document.getElementById('configCard').style.display = 'block';
+    document.getElementById('configCard').style.display = '';
     document.getElementById('currentConfig').textContent = 翻译值20118.kvCheckFailedError + 错误20122.message;
   }
 }
@@ -3189,6 +3281,7 @@ function 应用配置到界面(配置) {
   写入字段值('scu', 配置.scu);
   写入开关值('ena', 配置.ena, false);
   写入开关值('jk', 配置.jk, false);
+  写入字段值('jkSource', 配置.jkSource);
   const 家宽按钮 = document.getElementById('jkClientBtn');
   if (家宽按钮) 家宽按钮.style.display = 是否开关启用(配置.jk, false) ? '' : 'none';
   写入开关值('epd', 配置.epd, true);
@@ -3234,6 +3327,7 @@ function 收集界面配置() {
     scu: 读取字段值('scu'),
     ena: 读取开关值('ena', false),
     jk: 读取开关值('jk', false),
+    jkSource: 读取字段值('jkSource'),
     epd: 读取开关值('epd', true),
     epi: 读取开关值('epi', true),
     egi: 读取开关值('egi', true),
@@ -3265,12 +3359,12 @@ async function 加载当前配置() {
   try {
     const 响应20116 = await fetch(接口网址20117);
     if (响应20116.status === 503) {
-      document.getElementById('currentConfig').textContent = 'KV存储未配置，无法加载配置';
+      document.getElementById('currentConfig').textContent = '${语言码236 === 'en' ? 'KV storage is not configured. Config cannot be loaded.' : 'KV存储未配置，无法加载配置'}';
       return;
     }
     if (!响应20116.ok) {
       const 错误文本20115 = await 响应20116.text();
-      document.getElementById('currentConfig').textContent = '加载配置失败: ' + 错误文本20115;
+      document.getElementById('currentConfig').textContent = '${语言码236 === 'en' ? 'Failed to load config: ' : '加载配置失败: '}' + 错误文本20115;
       return;
     }
     const 配置 = await 响应20116.json();
@@ -3282,19 +3376,19 @@ async function 加载当前配置() {
         显示配置[键20114] = 值20113;
       }
     }
-    let 配置文本 = '当前配置:\\n';
+    let 配置文本 = '${语言码236 === 'en' ? 'Current config:\\n' : '当前配置:\\n'}';
     if (Object.keys(显示配置).length === 0) {
-      配置文本 += '(暂无配置)';
+      配置文本 += '${语言码236 === 'en' ? '(No config yet)' : '(暂无配置)'}';
     } else {
       for (const [键, 值20112] of Object.entries(显示配置)) {
-        配置文本 += 键 + ': ' + (值20112 || '(未设置)') + '\\n';
+        配置文本 += 键 + ': ' + (值20112 || '${语言码236 === 'en' ? '(Not set)' : '(未设置)'}') + '\\n';
       }
     }
     document.getElementById('currentConfig').textContent = 配置文本;
 
     应用配置到界面(配置);
   } catch (错误20111) {
-    document.getElementById('currentConfig').textContent = '加载配置失败: ' + 错误20111.message;
+    document.getElementById('currentConfig').textContent = '${语言码236 === 'en' ? 'Failed to load config: ' : '加载配置失败: '}' + 错误20111.message;
   }
 }
 
@@ -3304,9 +3398,9 @@ function 更新路径类型状态(customPath) {
   if (!element) return;
   element.replaceChildren();
   const configPath = document.createElement('div');
-  configPath.textContent = '配置路径：' + (customPath || '/' + window.CFNEW.uuid);
+  configPath.textContent = '${语言码236 === 'en' ? 'Config path: ' : '配置路径：'}' + (customPath || '/' + window.CFNEW.uuid);
   const label = document.createElement('div');
-  label.textContent = '订阅地址：';
+  label.textContent = '${语言码236 === 'en' ? 'Subscription URL: ' : '订阅地址：'}';
   const link = document.createElement('a');
   link.href = window.CFNEW.subUrl;
   link.textContent = window.CFNEW.subUrl;
@@ -3352,14 +3446,14 @@ async function 保存配置(配置数据20107) {
     });
     let 结果;
     try { 结果 = await 响应.json(); } catch {
-      throw new Error(响应.status === 413 ? '配置过大，请减少优选条目或改用列表 URL' : '服务器响应格式异常（HTTP ' + 响应.status + '），请稍后重试');
+      throw new Error(响应.status === 413 ? '${语言码236 === 'en' ? 'Config too large. Reduce preferred entries or use a list URL.' : '配置过大，请减少优选条目或改用列表 URL'}' : '${语言码236 === 'en' ? 'Unexpected server response (HTTP ' : '服务器响应格式异常（HTTP '}' + 响应.status + '${语言码236 === 'en' ? '). Please retry later.' : '），请稍后重试'}');
     }
-    if (!响应.ok || !结果 || 结果.success !== true) throw new Error(结果?.message || 结果?.error || '保存失败（HTTP ' + 响应.status + '）');
+    if (!响应.ok || !结果 || 结果.success !== true) throw new Error(结果?.message || 结果?.error || '${语言码236 === 'en' ? 'Save failed (HTTP ' : '保存失败（HTTP '}' + 响应.status + '${语言码236 === 'en' ? ')' : '）'}');
     await 加载当前配置();
     更新工作器地区状态();
     setTimeout(function () { window.location.reload(); }, 1500);
   } catch (错误) {
-    显示状态('保存失败: ' + 错误.message, 'error');
+    显示状态('${语言码236 === 'en' ? 'Save failed: ' : '保存失败: '}' + 错误.message, 'error');
     throw 错误;
   }
 }
@@ -3381,7 +3475,7 @@ function 显示状态(消息20100, 类型20099) {
   }
 }
 async function 重置全部配置() {
-  if (confirm('确定要重置所有配置吗？这将清空所有KV配置，恢复为环境变量设置。')) {
+  if (confirm('${语言码236 === 'en' ? 'Reset all config? This clears all KV config and restores the environment-variable settings.' : '确定要重置所有配置吗？这将清空所有KV配置，恢复为环境变量设置。'}')) {
     try {
       const 响应20098 = await fetch(window.CFNEW.apiBase + '/api/config', {
         method: 'POST',
@@ -3422,7 +3516,7 @@ async function 重置全部配置() {
         })
       });
       if (响应20098.status === 503) {
-        显示状态('KV存储未配置，无法重置配置。', 'error');
+        显示状态('${语言码236 === 'en' ? 'KV storage is not configured. Config cannot be reset.' : 'KV存储未配置，无法重置配置。'}', 'error');
         return;
       }
       if (!响应20098.ok) {
@@ -3431,15 +3525,15 @@ async function 重置全部配置() {
         // 尝试解析 JSON 错误信息
         try {
           const 错误数据 = JSON.parse(错误文本);
-          显示状态(错误数据.message || '重置失败', 'error');
+          显示状态(错误数据.message || '${语言码236 === 'en' ? 'Reset failed' : '重置失败'}', 'error');
         } catch (解析错误) {
           // 如果不是 JSON，直接显示文本
-          显示状态('重置失败: ' + 错误文本, 'error');
+          显示状态('${语言码236 === 'en' ? 'Reset failed: ' : '重置失败: '}' + 错误文本, 'error');
         }
         return;
       }
       const 结果20097 = await 响应20098.json();
-      显示状态(结果20097.message || '配置已重置', 结果20097.success ? 'success' : 'error');
+      显示状态(结果20097.message || '${语言码236 === 'en' ? 'Config has been reset' : '配置已重置'}', 结果20097.success ? 'success' : 'error');
       if (结果20097.success) {
         await 加载当前配置();
         // 更新wk地区选择状态
@@ -3450,7 +3544,7 @@ async function 重置全部配置() {
         }, 1500);
       }
     } catch (错误20096) {
-      显示状态('重置失败: ' + 错误20096.message, 'error');
+      显示状态('${语言码236 === 'en' ? 'Reset failed: ' : '重置失败: '}' + 错误20096.message, 'error');
     }
   }
 }
@@ -3460,7 +3554,7 @@ async function 检查加密问候状态() {
   try {
     const 当前网址 = window.location.href;
     const 订阅网址 = window.CFNEW.subUrl;
-    加密客户端问候状态值.innerHTML = 'ECH状态: <span style="color: #ffb400;">检测中...</span>';
+    加密客户端问候状态值.innerHTML = '${语言码236 === 'en' ? 'ECH status: ' : 'ECH状态: '}<span style="color: #ffb400;">${语言码236 === 'en' ? 'Checking...' : '检测中...'}</span>';
     const 响应20095 = await fetch(订阅网址, {
       method: 'GET',
       headers: {
@@ -3470,12 +3564,12 @@ async function 检查加密问候状态() {
     const 加密客户端问候状态头部 = 响应20095.headers.get('X-ECH-Status');
     const 加密客户端问候配置长度 = 响应20095.headers.get('X-ECH-Config-Length');
     if (加密客户端问候状态头部 === 'ENABLED') {
-      加密客户端问候状态值.innerHTML = 'ECH状态: <span style="color: #00ff9d;">✅ 已启用' + (加密客户端问候配置长度 ? ' (配置长度: ' + 加密客户端问候配置长度 + ')' : '') + '</span>';
+      加密客户端问候状态值.innerHTML = '${语言码236 === 'en' ? 'ECH status: ' : 'ECH状态: '}<span style="color: #00ff9d;">${语言码236 === 'en' ? '✓ Enabled' : '✓ 已启用'}' + (加密客户端问候配置长度 ? '${语言码236 === 'en' ? ' (config length: ' : ' (配置长度: '}' + 加密客户端问候配置长度 + ')' : '') + '</span>';
     } else {
-      加密客户端问候状态值.innerHTML = 'ECH状态: <span style="color: #ffb400;">⚠️ 未启用</span>';
+      加密客户端问候状态值.innerHTML = '${语言码236 === 'en' ? 'ECH status: ' : 'ECH状态: '}<span style="color: #ffb400;">${语言码236 === 'en' ? '⚠ Not enabled' : '⚠ 未启用'}</span>';
     }
   } catch (错误20094) {
-    加密客户端问候状态值.innerHTML = 'ECH状态: <span style="color: #ff3860;">❌ 检测失败: ' + 错误20094.message + '</span>';
+    加密客户端问候状态值.innerHTML = '${语言码236 === 'en' ? 'ECH status: ' : 'ECH状态: '}<span style="color: #ff3860;">${语言码236 === 'en' ? '✕ Check failed: ' : '✕ 检测失败: '}' + 错误20094.message + '</span>';
   }
 }
 document.addEventListener('DOMContentLoaded', function () {
@@ -3555,8 +3649,8 @@ document.addEventListener('DOMContentLoaded', function () {
       值值20084 = document.getElementById('et'),
       值值20083 = document.getElementById('ex');
     if (值值20085 && 值值20084 && 值值20083 && !值值20085.checked && !值值20084.checked && !值值20083.checked) {
-      显示操作状态('${是否值236 ? 解码64('2K3Yr9in2YLZhCDbjNqpINm+2LHZiNiq2qnZhCDYsdinINmB2LnYp9mEINqp2YbbjNivIQ==') : 解码64('6Iez5bCR6ZyA6KaB5ZCv55So5LiA5Liq5Y2P6K6u77yB')}', 'err');
-      显示提示('${是否值236 ? 解码64('2K3Yr9in2YLZhCDbjNqpINm+2LHZiNiq2qnZhCDYsdinINmB2LnYp9mEINqp2YbbjNivIQ==') : 解码64('6Iez5bCR6ZyA6KaB5ZCv55So5LiA5Liq5Y2P6K6u77yB')}', 'warn');
+      显示操作状态('${语言码236 === 'en' ? 'At least one protocol must be enabled!' : 解码64('6Iez5bCR6ZyA6KaB5ZCv55So5LiA5Liq5Y2P6K6u77yB')}', 'err');
+      显示提示('${语言码236 === 'en' ? 'At least one protocol must be enabled!' : 解码64('6Iez5bCR6ZyA6KaB5ZCv55So5LiA5Liq5Y2P6K6u77yB')}', 'warn');
       return;
     }
     const 本地值20082 = document.getElementById('cpBtnSaveAll');
@@ -3605,7 +3699,7 @@ document.addEventListener('DOMContentLoaded', function () {
     try {
       await 加载当前配置();
       if (值操作值) 值操作值.classList.remove('cp-dirty');
-      显示操作状态('${是否值236 ? 'تنظیمات تازه‌سازی شد' : '配置已刷新'}');
+      显示操作状态('${语言码236 === 'en' ? 'Config refreshed' : '配置已刷新'}');
     } finally {
       值值值20080.classList.remove('cp-action-btn-saving');
     }
@@ -3759,7 +3853,7 @@ document.addEventListener('DOMContentLoaded', function () {
       const 地址列表 = 生成云墙随机地址(数量, 端口20067);
       document.getElementById('latencyTestInput').value = 地址列表.join(',');
       手动输入值.style.display = 'block';
-      显示状态('${是否值236 ? 'تولید شد' : '已生成'} ' + 数量 + ' ${是否值236 ? 'IP تصادفی CF' : '个CF随机IP'}', 'success');
+      显示状态('${语言码236 === 'en' ? 'Generated' : '已生成'} ' + 数量 + ' ${语言码236 === 'en' ? ' CF random IPs' : '个CF随机IP'}', 'success');
     });
   }
   if (获取地址值) {
@@ -3767,11 +3861,11 @@ document.addEventListener('DOMContentLoaded', function () {
       const 网址输入 = document.getElementById('fetchURLInput');
       const 获取网址 = 网址输入.value.trim();
       if (!获取网址) {
-        显示提示('${是否值236 ? 'لطفا URL را وارد کنید' : '请输入URL'}', 'warn');
+        显示提示('${语言码236 === 'en' ? 'Please enter a URL' : '请输入URL'}', 'warn');
         return;
       }
       获取地址值.disabled = true;
-      获取地址值.textContent = '${是否值236 ? 'در حال دریافت...' : '获取中...'}';
+      获取地址值.textContent = '${语言码236 === 'en' ? 'Fetching...' : '获取中...'}';
       try {
         // 支持多个 URL（逗号分隔）以及返回内容中逗号分隔的多个 IP/节点
         const 网址列表 = Array.from(new Set(获取网址.split(',').map(网址值20066 => 网址值20066.trim()).filter(网址值20065 => 网址值20065)));
@@ -3790,15 +3884,15 @@ document.addEventListener('DOMContentLoaded', function () {
         if (值项目列表.length > 0) {
           document.getElementById('latencyTestInput').value = 值项目列表.join(',');
           手动输入值.style.display = 'block';
-          显示状态('${是否值236 ? 'دریافت شد' : '已获取'} ' + 值项目列表.length + ' ${是否值236 ? 'IP' : '个IP'}', 'success');
+          显示状态('${语言码236 === 'en' ? 'Fetched' : '已获取'} ' + 值项目列表.length + ' ${语言码236 === 'en' ? ' IPs' : '个IP'}', 'success');
         } else {
-          显示状态('${是否值236 ? 'داده‌ای یافت نشد' : '未获取到数据'}', 'error');
+          显示状态('${语言码236 === 'en' ? 'No data fetched' : '未获取到数据'}', 'error');
         }
       } catch (错误20060) {
-        显示状态('${是否值236 ? 'خطا در دریافت' : '获取失败'}: ' + 错误20060.message, 'error');
+        显示状态('${语言码236 === 'en' ? 'Fetch failed' : '获取失败'}: ' + 错误20060.message, 'error');
       } finally {
         获取地址值.disabled = false;
-        获取地址值.textContent = '⬇ ${是否值236 ? 'دریافت IP' : '获取IP'}';
+        获取地址值.textContent = '↓ ${语言码236 === 'en' ? 'Fetch IPs' : '获取IP'}';
       }
     });
   }
@@ -3811,7 +3905,7 @@ document.addEventListener('DOMContentLoaded', function () {
       const 默认端口 = 端口值.value || '443';
       const 线程数 = parseInt(线程数值.value) || 5;
       if (!输入值) {
-        显示状态('${是否值236 ? 'لطفا IP یا دامنه وارد کنید' : '请输入IP或域名'}', 'error');
+        显示状态('${语言码236 === 'en' ? 'Please enter an IP or domain' : '请输入IP或域名'}', 'error');
         return;
       }
       const 本地值20058 = 输入值.split(',').map(翻译值20057 => 翻译值20057.trim()).filter(翻译值20056 => 翻译值20056);
@@ -3900,7 +3994,7 @@ document.addEventListener('DOMContentLoaded', function () {
       for (let 索引值20037 = 0; 索引值20037 < 本地值20054; 索引值20037 += 线程数) {
         if (测试值控制器.signal.aborted) break;
         const 本地值20036 = 本地值20058.slice(索引值20037, Math.min(索引值20037 + 线程数, 本地值20054));
-        测试状态.textContent = '${是否值236 ? 'در حال تست' : '测试中'}: ' + (索引值20037 + 1) + '-' + Math.min(索引值20037 + 线程数, 本地值20054) + '/' + 本地值20054 + ' (${是否值236 ? 'رشته‌ها' : '线程'}: ' + 线程数 + ')';
+        测试状态.textContent = '${语言码236 === 'en' ? 'Testing' : '测试中'}: ' + (索引值20037 + 1) + '-' + Math.min(索引值20037 + 线程数, 本地值20054) + '/' + 本地值20054 + ' (${语言码236 === 'en' ? 'Threads' : '线程'}: ' + 线程数 + ')';
         const 结果列表 = await Promise.all(本地值20036.map(翻译值 => 测试单项(翻译值)));
         for (const 结果20035 of 结果列表) {
           if (结果20035) {
@@ -3911,7 +4005,7 @@ document.addEventListener('DOMContentLoaded', function () {
           }
         }
       }
-      测试状态.textContent = '${是否值236 ? 'تست کامل شد' : '测试完成'}: ' + 本地值20055 + '/' + 本地值20054;
+      测试状态.textContent = '${语言码236 === 'en' ? 'Test complete' : '测试完成'}: ' + 本地值20055 + '/' + 本地值20054;
       开始测试值.style.display = 'inline-block';
       值测试值.style.display = 'none';
 
@@ -3926,7 +4020,7 @@ document.addEventListener('DOMContentLoaded', function () {
       }
       开始测试值.style.display = 'inline-block';
       值测试值.style.display = 'none';
-      测试状态.textContent = '${是否值236 ? 'تست متوقف شد' : '测试已停止'}';
+      测试状态.textContent = '${语言码236 === 'en' ? 'Test stopped' : '测试已停止'}';
     });
   }
   if (选择值值) {
@@ -3946,7 +4040,7 @@ document.addEventListener('DOMContentLoaded', function () {
   function 获取已选项目() {
     const 本地值20029 = 结果列表列表.querySelectorAll('input[type="checkbox"]:checked');
     if (本地值20029.length === 0) {
-      显示状态('${是否值236 ? 'لطفا حداقل یک مورد انتخاب کنید' : '请至少选择一项'}', 'error');
+      显示状态('${语言码236 === 'en' ? 'Select at least one item' : '请至少选择一项'}', 'error');
       return null;
     }
     const 已选项目列表20028 = [];
@@ -3973,7 +4067,7 @@ document.addEventListener('DOMContentLoaded', function () {
       值输入20023.value = 新值20022;
       覆盖已选值.disabled = true;
       追加已选值.disabled = true;
-      覆盖已选值.textContent = '${是否值236 ? 'در حال ذخیره...' : '保存中...'}';
+      覆盖已选值.textContent = '${语言码236 === 'en' ? 'Saving...' : '保存中...'}';
       try {
         const 配置数据20021 = {
           p: document.getElementById('customIP').value,
@@ -3982,13 +4076,13 @@ document.addEventListener('DOMContentLoaded', function () {
           s: document.getElementById('socksConfig').value
         };
         await 保存配置(配置数据20021);
-        显示状态('${是否值236 ? 'موفقیت‌آمیز بود' : '已覆盖'} ' + 已选项目列表20024.length + ' ${是否值236 ? 'مورد و ذخیره شد' : '项并已保存'}', 'success');
+        显示状态('${语言码236 === 'en' ? 'Overwrote' : '已覆盖'} ' + 已选项目列表20024.length + ' ${语言码236 === 'en' ? ' items and saved' : '项并已保存'}', 'success');
       } catch (错误20020) {
-        显示状态('${是否值236 ? 'خطا در ذخیره' : '保存失败'}: ' + 错误20020.message, 'error');
+        显示状态('${语言码236 === 'en' ? 'Save failed' : '保存失败'}: ' + 错误20020.message, 'error');
       } finally {
         覆盖已选值.disabled = false;
         追加已选值.disabled = false;
-        覆盖已选值.textContent = '${是否值236 ? '覆盖添加' : '覆盖添加'}';
+        覆盖已选值.textContent = '${语言码236 === 'en' ? 'Overwrite & add' : '覆盖添加'}';
       }
     });
   }
@@ -4005,7 +4099,7 @@ document.addEventListener('DOMContentLoaded', function () {
       值输入.value = 新值;
       覆盖已选值.disabled = true;
       追加已选值.disabled = true;
-      追加已选值.textContent = '${是否值236 ? 'در حال ذخیره...' : '保存中...'}';
+      追加已选值.textContent = '${语言码236 === 'en' ? 'Saving...' : '保存中...'}';
       try {
         const 配置数据 = {
           p: document.getElementById('customIP').value,
@@ -4014,13 +4108,13 @@ document.addEventListener('DOMContentLoaded', function () {
           s: document.getElementById('socksConfig').value
         };
         await 保存配置(配置数据);
-        显示状态('${是否值236 ? 'موفقیت‌آمیز بود' : '已追加'} ' + 已选项目列表.length + ' ${是否值236 ? 'مورد و ذخیره شد' : '项并已保存'}', 'success');
+        显示状态('${语言码236 === 'en' ? 'Appended' : '已追加'} ' + 已选项目列表.length + ' ${语言码236 === 'en' ? ' items and saved' : '项并已保存'}', 'success');
       } catch (错误20019) {
-        显示状态('${是否值236 ? 'خطا در ذخیره' : '保存失败'}: ' + 错误20019.message, 'error');
+        显示状态('${语言码236 === 'en' ? 'Save failed' : '保存失败'}: ' + 错误20019.message, 'error');
       } finally {
         覆盖已选值.disabled = false;
         追加已选值.disabled = false;
-        追加已选值.textContent = '${是否值236 ? '追加添加' : '追加添加'}';
+        追加已选值.textContent = '${语言码236 === 'en' ? 'Append & add' : '追加添加'}';
       }
     });
   }
@@ -4309,8 +4403,282 @@ document.addEventListener('DOMContentLoaded', function () {
     'NAS': '🇧🇸 拿骚',
     'MBJ': '🇯🇲 蒙特哥贝'
   };
+  const 机房映射En = {
+    'SJC': '🇺🇸 San Jose',
+    'LAX': '🇺🇸 Los Angeles',
+    'SEA': '🇺🇸 Seattle',
+    'SFO': '🇺🇸 San Francisco',
+    'DFW': '🇺🇸 Dallas',
+    'ORD': '🇺🇸 Chicago',
+    'IAD': '🇺🇸 Washington',
+    'ATL': '🇺🇸 Atlanta',
+    'MIA': '🇺🇸 Miami',
+    'DEN': '🇺🇸 Denver',
+    'PHX': '🇺🇸 Phoenix',
+    'BOS': '🇺🇸 Boston',
+    'EWR': '🇺🇸 Newark',
+    'JFK': '🇺🇸 New York',
+    'LAS': '🇺🇸 Las Vegas',
+    'MSP': '🇺🇸 Minneapolis',
+    'DTW': '🇺🇸 Detroit',
+    'PHL': '🇺🇸 Philadelphia',
+    'CLT': '🇺🇸 Charlotte',
+    'SLC': '🇺🇸 Salt Lake City',
+    'PDX': '🇺🇸 Portland',
+    'SAN': '🇺🇸 San Diego',
+    'TPA': '🇺🇸 Tampa',
+    'IAH': '🇺🇸 Houston',
+    'MCO': '🇺🇸 Orlando',
+    'AUS': '🇺🇸 Austin',
+    'BNA': '🇺🇸 Nashville',
+    'RDU': '🇺🇸 Raleigh',
+    'IND': '🇺🇸 Indianapolis',
+    'CMH': '🇺🇸 Columbus',
+    'MCI': '🇺🇸 Kansas City',
+    'OMA': '🇺🇸 Omaha',
+    'ABQ': '🇺🇸 Albuquerque',
+    'OKC': '🇺🇸 Oklahoma City',
+    'MEM': '🇺🇸 Memphis',
+    'JAX': '🇺🇸 Jacksonville',
+    'RIC': '🇺🇸 Richmond',
+    'BUF': '🇺🇸 Buffalo',
+    'PIT': '🇺🇸 Pittsburgh',
+    'CLE': '🇺🇸 Cleveland',
+    'CVG': '🇺🇸 Cincinnati',
+    'MKE': '🇺🇸 Milwaukee',
+    'STL': '🇺🇸 St. Louis',
+    'SAT': '🇺🇸 San Antonio',
+    'HNL': '🇺🇸 Honolulu',
+    'ANC': '🇺🇸 Anchorage',
+    'SMF': '🇺🇸 Sacramento',
+    'ONT': '🇺🇸 Ontario',
+    'OAK': '🇺🇸 Oakland',
+    'HKG': '🇭🇰 Hong Kong',
+    'TPE': '🇹🇼 Taipei',
+    'TSA': '🇹🇼 Taipei Songshan',
+    'KHH': '🇹🇼 Kaohsiung',
+    'NRT': '🇯🇵 Tokyo Narita',
+    'HND': '🇯🇵 Tokyo Haneda',
+    'KIX': '🇯🇵 Osaka Kansai',
+    'ITM': '🇯🇵 Osaka Itami',
+    'NGO': '🇯🇵 Nagoya',
+    'FUK': '🇯🇵 Fukuoka',
+    'CTS': '🇯🇵 Sapporo',
+    'OKA': '🇯🇵 Okinawa',
+    'ICN': '🇰🇷 Seoul Incheon',
+    'GMP': '🇰🇷 Seoul Gimpo',
+    'PUS': '🇰🇷 Busan',
+    'SIN': '🇸🇬 Singapore',
+    'BKK': '🇹🇭 Bangkok',
+    'DMK': '🇹🇭 Bangkok Don Mueang',
+    'KUL': '🇲🇾 Kuala Lumpur',
+    'CGK': '🇮🇩 Jakarta',
+    'MNL': '🇵🇭 Manila',
+    'CEB': '🇵🇭 Cebu',
+    'HAN': '🇻🇳 Hanoi',
+    'SGN': '🇻🇳 Ho Chi Minh City',
+    'DAD': '🇻🇳 Da Nang',
+    'RGN': '🇲🇲 Yangon',
+    'PNH': '🇰🇭 Phnom Penh',
+    'REP': '🇰🇭 Siem Reap',
+    'VTE': '🇱🇦 Vientiane',
+    'BOM': '🇮🇳 Mumbai',
+    'DEL': '🇮🇳 New Delhi',
+    'MAA': '🇮🇳 Chennai',
+    'BLR': '🇮🇳 Bengaluru',
+    'CCU': '🇮🇳 Kolkata',
+    'HYD': '🇮🇳 Hyderabad',
+    'AMD': '🇮🇳 Ahmedabad',
+    'COK': '🇮🇳 Kochi',
+    'PNQ': '🇮🇳 Pune',
+    'GOI': '🇮🇳 Goa',
+    'CMB': '🇱🇰 Colombo',
+    'DAC': '🇧🇩 Dhaka',
+    'KTM': '🇳🇵 Kathmandu',
+    'ISB': '🇵🇰 Islamabad',
+    'KHI': '🇵🇰 Karachi',
+    'LHE': '🇵🇰 Lahore',
+    'LHR': '🇬🇧 London Heathrow',
+    'LGW': '🇬🇧 London Gatwick',
+    'STN': '🇬🇧 London Stansted',
+    'LTN': '🇬🇧 London Luton',
+    'MAN': '🇬🇧 Manchester',
+    'EDI': '🇬🇧 Edinburgh',
+    'BHX': '🇬🇧 Birmingham',
+    'CDG': '🇫🇷 Paris Charles de Gaulle',
+    'ORY': '🇫🇷 Paris Orly',
+    'MRS': '🇫🇷 Marseille',
+    'LYS': '🇫🇷 Lyon',
+    'NCE': '🇫🇷 Nice',
+    'FRA': '🇩🇪 Frankfurt',
+    'MUC': '🇩🇪 Munich',
+    'TXL': '🇩🇪 Berlin',
+    'BER': '🇩🇪 Berlin Brandenburg',
+    'HAM': '🇩🇪 Hamburg',
+    'DUS': '🇩🇪 Düsseldorf',
+    'CGN': '🇩🇪 Cologne',
+    'STR': '🇩🇪 Stuttgart',
+    'AMS': '🇳🇱 Amsterdam',
+    'BRU': '🇧🇪 Brussels',
+    'LUX': '🇱🇺 Luxembourg',
+    'ZRH': '🇨🇭 Zurich',
+    'GVA': '🇨🇭 Geneva',
+    'BSL': '🇨🇭 Basel',
+    'VIE': '🇦🇹 Vienna',
+    'PRG': '🇨🇿 Prague',
+    'BUD': '🇭🇺 Budapest',
+    'WAW': '🇵🇱 Warsaw',
+    'KRK': '🇵🇱 Kraków',
+    'MXP': '🇮🇹 Milan Malpensa',
+    'LIN': '🇮🇹 Milan Linate',
+    'FCO': '🇮🇹 Rome',
+    'VCE': '🇮🇹 Venice',
+    'NAP': '🇮🇹 Naples',
+    'FLR': '🇮🇹 Florence',
+    'BGY': '🇮🇹 Bergamo',
+    'MAD': '🇪🇸 Madrid',
+    'BCN': '🇪🇸 Barcelona',
+    'PMI': '🇪🇸 Palma',
+    'AGP': '🇪🇸 Málaga',
+    'VLC': '🇪🇸 Valencia',
+    'SVQ': '🇪🇸 Seville',
+    'BIO': '🇪🇸 Bilbao',
+    'LIS': '🇵🇹 Lisbon',
+    'OPO': '🇵🇹 Porto',
+    'FAO': '🇵🇹 Faro',
+    'DUB': '🇮🇪 Dublin',
+    'CPH': '🇩🇰 Copenhagen',
+    'ARN': '🇸🇪 Stockholm',
+    'GOT': '🇸🇪 Gothenburg',
+    'OSL': '🇳🇴 Oslo',
+    'BGO': '🇳🇴 Bergen',
+    'HEL': '🇫🇮 Helsinki',
+    'RIX': '🇱🇻 Riga',
+    'TLL': '🇪🇪 Tallinn',
+    'VNO': '🇱🇹 Vilnius',
+    'ATH': '🇬🇷 Athens',
+    'SKG': '🇬🇷 Thessaloniki',
+    'SOF': '🇧🇬 Sofia',
+    'OTP': '🇷🇴 Bucharest',
+    'BEG': '🇷🇸 Belgrade',
+    'ZAG': '🇭🇷 Zagreb',
+    'LJU': '🇸🇮 Ljubljana',
+    'KBP': '🇺🇦 Kyiv',
+    'IEV': '🇺🇦 Kyiv Zhulyany',
+    'ODS': '🇺🇦 Odesa',
+    'SVO': '🇷🇺 Moscow Sheremetyevo',
+    'DME': '🇷🇺 Moscow Domodedovo',
+    'VKO': '🇷🇺 Moscow Vnukovo',
+    'LED': '🇷🇺 St. Petersburg',
+    'IST': '🇹🇷 Istanbul',
+    'SAW': '🇹🇷 Istanbul Sabiha',
+    'ESB': '🇹🇷 Ankara',
+    'AYT': '🇹🇷 Antalya',
+    'ADB': '🇹🇷 Izmir',
+    'TLV': '🇮🇱 Tel Aviv',
+    'AMM': '🇯🇴 Amman',
+    'BEY': '🇱🇧 Beirut',
+    'BAH': '🇧🇭 Bahrain',
+    'KWI': '🇰🇼 Kuwait',
+    'DXB': '🇦🇪 Dubai',
+    'AUH': '🇦🇪 Abu Dhabi',
+    'SHJ': '🇦🇪 Sharjah',
+    'DOH': '🇶🇦 Doha',
+    'MCT': '🇴🇲 Muscat',
+    'RUH': '🇸🇦 Riyadh',
+    'JED': '🇸🇦 Jeddah',
+    'DMM': '🇸🇦 Dammam',
+    'CAI': '🇪🇬 Cairo',
+    'HBE': '🇪🇬 Alexandria',
+    'SSH': '🇪🇬 Sharm El Sheikh',
+    'CMN': '🇲🇦 Casablanca',
+    'RAK': '🇲🇦 Marrakesh',
+    'TUN': '🇹🇳 Tunis',
+    'ALG': '🇩🇿 Algiers',
+    'LOS': '🇳🇬 Lagos',
+    'ABV': '🇳🇬 Abuja',
+    'ACC': '🇬🇭 Accra',
+    'NBO': '🇰🇪 Nairobi',
+    'MBA': '🇰🇪 Mombasa',
+    'ADD': '🇪🇹 Addis Ababa',
+    'DAR': '🇹🇿 Dar es Salaam',
+    'JNB': '🇿🇦 Johannesburg',
+    'CPT': '🇿🇦 Cape Town',
+    'DUR': '🇿🇦 Durban',
+    'HRE': '🇿🇼 Harare',
+    'LUN': '🇿🇲 Lusaka',
+    'MRU': '🇲🇺 Mauritius',
+    'SEZ': '🇸🇨 Seychelles',
+    'SYD': '🇦🇺 Sydney',
+    'MEL': '🇦🇺 Melbourne',
+    'BNE': '🇦🇺 Brisbane',
+    'PER': '🇦🇺 Perth',
+    'ADL': '🇦🇺 Adelaide',
+    'CBR': '🇦🇺 Canberra',
+    'OOL': '🇦🇺 Gold Coast',
+    'CNS': '🇦🇺 Cairns',
+    'AKL': '🇳🇿 Auckland',
+    'WLG': '🇳🇿 Wellington',
+    'CHC': '🇳🇿 Christchurch',
+    'ZQN': '🇳🇿 Queenstown',
+    'NAN': '🇫🇯 Nadi',
+    'PPT': '🇵🇫 Papeete',
+    'GUM': '🇬🇺 Guam',
+    'GRU': '🇧🇷 São Paulo Guarulhos',
+    'CGH': '🇧🇷 São Paulo Congonhas',
+    'GIG': '🇧🇷 Rio de Janeiro',
+    'BSB': '🇧🇷 Brasília',
+    'CNF': '🇧🇷 Belo Horizonte',
+    'POA': '🇧🇷 Porto Alegre',
+    'CWB': '🇧🇷 Curitiba',
+    'FOR': '🇧🇷 Fortaleza',
+    'REC': '🇧🇷 Recife',
+    'SSA': '🇧🇷 Salvador',
+    'EZE': '🇦🇷 Buenos Aires',
+    'AEP': '🇦🇷 Buenos Aires City',
+    'COR': '🇦🇷 Córdoba',
+    'MDZ': '🇦🇷 Mendoza',
+    'SCL': '🇨🇱 Santiago',
+    'LIM': '🇵🇪 Lima',
+    'BOG': '🇨🇴 Bogotá',
+    'MDE': '🇨🇴 Medellín',
+    'CLO': '🇨🇴 Cali',
+    'UIO': '🇪🇨 Quito',
+    'GYE': '🇪🇨 Guayaquil',
+    'CCS': '🇻🇪 Caracas',
+    'MVD': '🇺🇾 Montevideo',
+    'ASU': '🇵🇾 Asunción',
+    'PTY': '🇵🇦 Panama City',
+    'SJO': '🇨🇷 San José',
+    'GUA': '🇬🇹 Guatemala City',
+    'SAL': '🇸🇻 San Salvador',
+    'TGU': '🇭🇳 Tegucigalpa',
+    'MGA': '🇳🇮 Managua',
+    'BZE': '🇧🇿 Belize City',
+    'MEX': '🇲🇽 Mexico City',
+    'GDL': '🇲🇽 Guadalajara',
+    'MTY': '🇲🇽 Monterrey',
+    'CUN': '🇲🇽 Cancún',
+    'TIJ': '🇲🇽 Tijuana',
+    'SJD': '🇲🇽 San José del Cabo',
+    'YYZ': '🇨🇦 Toronto',
+    'YVR': '🇨🇦 Vancouver',
+    'YUL': '🇨🇦 Montreal',
+    'YYC': '🇨🇦 Calgary',
+    'YEG': '🇨🇦 Edmonton',
+    'YOW': '🇨🇦 Ottawa',
+    'YWG': '🇨🇦 Winnipeg',
+    'YHZ': '🇨🇦 Halifax',
+    'HAV': '🇨🇺 Havana',
+    'SJU': '🇵🇷 San Juan',
+    'SDQ': '🇩🇴 Santo Domingo',
+    'PAP': '🇭🇹 Port-au-Prince',
+    'KIN': '🇯🇲 Kingston',
+    'NAS': '🇧🇸 Nassau',
+    'MBJ': '🇯🇲 Montego Bay'
+  };
   function 获取机房名称(机房20018) {
-    return 机房映射[机房20018] || 机房20018;
+    return (${语言码236 === 'en' ? '机房映射En[机房20018] || 机房映射[机房20018]' : '机房映射[机房20018]'}) || 机房20018;
   }
 
   // 城市筛选相关函数
@@ -4674,6 +5042,7 @@ function 更新配置值() {
   启用仓库优选 = 有效配置.egi === 'yes';
   启用原生地址 = 有效配置.ena === 'yes';
   启用家宽链式 = 有效配置.jk === 'yes';
+  家宽自定义源网址 = (有效配置.jkSource || '').trim();
   启用加密客户端问候 = 有效配置.ech === 'yes';
   自定义域名系统 = 有效配置.customDNS || 配置默认值.customDNS;
   自定义加密客户端问候域名 = 有效配置.customECHDomain || 配置默认值.customECHDomain;

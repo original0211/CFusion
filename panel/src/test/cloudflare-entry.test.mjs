@@ -108,3 +108,17 @@ test('P4：build-cloudflare 组装出 worker/cf-assets/src 三件套且资源真
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('缓存策略：控制台 HTML 私有缓存 5 分钟，处理器自设缓存头保留，API 与错误页仍 no-store', async () => {
+  const mk = response => createCloudflareHandler({ loadPanel: async () => ({ handlePanel: async () => response }) });
+  let r = await mk(new Response('<html>壳</html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } }))(new Request('https://panel.example/some-uuid'), {});
+  assert.equal(r.headers.get('cache-control'), 'private, max-age=300');
+  r = await mk(new Response('x', { headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'public, max-age=86400' } }))(new Request('https://panel.example/rules-license'), {});
+  assert.equal(r.headers.get('cache-control'), 'public, max-age=86400');
+  r = await mk(Response.json({ ok: true }))(new Request('https://panel.example/some-uuid/api/config'), {});
+  assert.equal(r.headers.get('cache-control'), 'no-store');
+  r = await mk(new Response('<html>err</html>', { status: 400, headers: { 'Content-Type': 'text/html' } }))(new Request('https://panel.example/some-uuid'), {});
+  assert.equal(r.headers.get('cache-control'), 'no-store');
+  r = await mk(new Response('<html>壳</html>', { method: 'POST', headers: { 'Content-Type': 'text/html' } }))(new Request('https://panel.example/some-uuid', { method: 'POST' }), {});
+  assert.equal(r.headers.get('cache-control'), 'no-store');
+});

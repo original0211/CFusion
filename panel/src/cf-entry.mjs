@@ -28,12 +28,23 @@ export function prepareCloudflareRuntime(env = {}, { assets, singboxRulesGzBase6
   return proc;
 }
 
-function finalize(response, method) {
+function finalize(response, request) {
   const headers = new Headers(response.headers);
-  headers.set('Cache-Control', 'no-store');
+  if (!headers.has('Cache-Control')) {
+    // 控制台 HTML 是静态壳：数据走 API 单独拉取，壳本身允许浏览器私有缓存
+    // 5 分钟，避免每次打开都全量重下 195KB 并重解析内联脚本（实测卡顿主因）。
+    // 处理器自己设了 Cache-Control 的响应（订阅、/rules-license 等）原样保留；
+    // 其余（配置/管理 API、非 200、非 HTML）一律维持 no-store。
+    const type = headers.get('Content-Type') || '';
+    if (request.method === 'GET' && response.status === 200 && type.includes('text/html')) {
+      headers.set('Cache-Control', 'private, max-age=300');
+    } else {
+      headers.set('Cache-Control', 'no-store');
+    }
+  }
   headers.set('Referrer-Policy', 'no-referrer');
   headers.set('X-Content-Type-Options', 'nosniff');
-  return new Response(method === 'HEAD' ? null : response.body, { status: response.status, headers });
+  return new Response(request.method === 'HEAD' ? null : response.body, { status: response.status, headers });
 }
 
 export function createCloudflareHandler({ loadPanel, assets, singboxRulesGzBase64 } = {}) {
@@ -44,9 +55,11 @@ export function createCloudflareHandler({ loadPanel, assets, singboxRulesGzBase6
       prepareCloudflareRuntime(env, { assets, singboxRulesGzBase64 });
       panelPromise = panelPromise || load();
       const { handlePanel } = await panelPromise;
-      return finalize(await handlePanel(request), request.method);
+      return finalize(await handlePanel(request), request);
     } catch {
-      return finalize(Response.json({ success: false, message: '服务暂时不可用，请稍后重试' }, { status: 500 }), request.method);
+      const cookieLang = (request.headers.get('cookie') || '').match(/(?:^|;\s*)preferredLanguage=([^;]*)/)?.[1] || '';
+      const message = cookieLang.toLowerCase().startsWith('en') ? 'Service temporarily unavailable. Please retry later.' : '服务暂时不可用，请稍后重试';
+      return finalize(Response.json({ success: false, message }, { status: 500 }), request);
     }
   };
 }
