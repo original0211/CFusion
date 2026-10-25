@@ -2060,8 +2060,6 @@ en: {
 
     </head>
     <body>
-        <div class="matrix-bg"></div>
-        <div class="matrix-code-rain" id="matrixCodeRain"></div>
         <header class="sq-topbar">
           <div class="sq-topbar-in">
             <span class="sq-brand">CFUSION</span>
@@ -2072,10 +2070,6 @@ en: {
                     <option value="en" ${语言码236 === 'en' ? 'selected' : ''}>English</option>
                 </select>
             </div>
-            <button type="button" id="cpFxToggle" class="cp-fx-toggle" onclick="window.切换页面特效()" title="${语言码236 === 'en' ? 'Toggle page effects' : '切换页面特效'}" aria-label="FX toggle">
-                <span class="cp-fx-dot" aria-hidden="true"></span>
-                <span id="cpFxLabel">FX: ON</span>
-            </button>
             <div class="cp-hud">
                 <span class="cp-hud-line"><span class="cp-hud-label">SYS::</span> ${翻译值.terminal}</span>
                 <span class="cp-hud-line"><span class="cp-hud-label">NODE::</span> NIGHT_CITY</span>
@@ -2100,7 +2094,7 @@ en: {
         </header>
         <div class="container">
             <div class="header">
-                    <h1 class="title cp-glitch" data-text="${翻译值.title}">${翻译值.title}</h1>
+                    <h1 class="title">${翻译值.title}</h1>
                     <p class="subtitle">${翻译值.subtitle}</p>
             </div>
             <div class="card">
@@ -2777,79 +2771,6 @@ function 生成客户端链接(客户端类型, 客户端名称) {
   }
 }
 
-// 页面特效图形化开关 (localStorage 持久化)
-window.应用页面特效 = function () {
-  var 本地值20189 = localStorage.getItem('cp-fx-off') === '1';
-  document.body.classList.toggle('fx-off', 本地值20189);
-  var 本地值20188 = document.getElementById('cpFxLabel');
-  if (本地值20188) 本地值20188.textContent = 本地值20189 ? 'FX: OFF' : 'FX: ON';
-  if (本地值20189) {
-    var 本地值20187 = document.getElementById('matrixCodeRain');
-    if (本地值20187) 本地值20187.innerHTML = '';
-  } else if (typeof 创建矩阵雨 === 'function') {
-    var 结果值 = document.getElementById('matrixCodeRain');
-    if (结果值 && !结果值.firstChild) 创建矩阵雨();
-  }
-};
-window.切换页面特效 = function () {
-  var 本地值20186 = localStorage.getItem('cp-fx-off') === '1';
-  localStorage.setItem('cp-fx-off', 本地值20186 ? '0' : '1');
-  window.应用页面特效();
-};
-(function () {
-  if (localStorage.getItem('cp-fx-off') === '1') {
-    document.addEventListener('DOMContentLoaded', function () {
-      document.body.classList.add('fx-off');
-      var 本地值20185 = document.getElementById('cpFxLabel');
-      if (本地值20185) 本地值20185.textContent = 'FX: OFF';
-    });
-  }
-})();
-function 创建矩阵雨() {
-  if (document.body && document.body.classList.contains('fx-off')) return;
-  const 矩阵值 = document.getElementById('matrixCodeRain');
-  if (!矩阵值) return;
-  const 赛博字符列表 = '01アイウエオカキクケコサシスセソタチツテトナニヌネノ$%#@!?<>+=ABCDEF';
-  const 调色板 = ['#00f0ff', '#ff2bd6', '#a347ff', '#00ff9d'];
-  const 列数 = Math.floor(window.innerWidth / 20);
-  for (let 索引值20184 = 0; 索引值20184 < 列数; 索引值20184++) {
-    const 列20183 = document.createElement('div');
-    列20183.className = 'matrix-column';
-    列20183.style.left = 索引值20184 * 20 + 'px';
-    列20183.style.animationDelay = -Math.random() * 15 + 's';
-    列20183.style.animationDuration = Math.random() * 14 + 8 + 's';
-    列20183.style.fontSize = Math.random() * 4 + 12 + 'px';
-    列20183.style.opacity = (Math.random() * 0.7 + 0.3).toFixed(2);
-    let 文本20182 = '';
-    const 字符数量 = Math.floor(Math.random() * 30 + 18);
-    for (let 次索引值 = 0; 次索引值 < 字符数量; 次索引值++) {
-      const 字符 = 赛博字符列表[Math.floor(Math.random() * 赛博字符列表.length)];
-      const 值强调 = Math.random() > 0.85;
-      const 颜色 = 值强调 ? 调色板[Math.floor(Math.random() * 调色板.length)] : '';
-      文本20182 += 颜色 ? '<span style="color:' + 颜色 + ';text-shadow:0 0 8px ' + 颜色 + ';">' + 字符 + '</span><br>' : '<span>' + 字符 + '</span><br>';
-    }
-    列20183.innerHTML = 文本20182;
-    矩阵值.appendChild(列20183);
-  }
-  setInterval(function () {
-    const 列列表 = 矩阵值.querySelectorAll('.matrix-column');
-    列列表.forEach(function (列) {
-      if (Math.random() > 0.94) {
-        const 字符列表 = 列.querySelectorAll('span');
-        if (字符列表.length > 0) {
-          const 目标20181 = 字符列表[Math.floor(Math.random() * 字符列表.length)];
-          const 本地值20180 = 目标20181.style.color;
-          目标20181.style.color = '#ffffff';
-          目标20181.style.textShadow = '0 0 10px #ffffff, 0 0 18px #00f0ff';
-          setTimeout(function () {
-            目标20181.style.color = 本地值20180;
-            目标20181.style.textShadow = '';
-          }, 200);
-        }
-      }
-    });
-  }, 110);
-}
 async function 检查系统状态() {
   const 状态标题 = document.getElementById('systemStatusHead');
   const 标记检测完成 = () => { if (状态标题 && 状态标题.dataset.done) 状态标题.textContent = 状态标题.dataset.done; };
@@ -3573,7 +3494,6 @@ async function 检查加密问候状态() {
   }
 }
 document.addEventListener('DOMContentLoaded', function () {
-  创建矩阵雨();
   检查系统状态();
   检查键值状态();
   检查加密问候状态();

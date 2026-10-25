@@ -1,5 +1,5 @@
 /* CFusion console theme — Squarespace-style editorial minimal (round 2).
-   Structure: sticky top bar (brand / language / FX / status / actions),
+   Structure: sticky top bar (brand / language / status / actions),
    sections laid out as label column + content column separated by
    hairlines, underline form fields, rectangular uppercase buttons,
    subscription clients as rows.
@@ -38,8 +38,6 @@
             }
             /* Legacy decorative layers (grid / scanlines / matrix rain) are gone. */
             body::before, body::after { content: none !important; display: none !important; }
-            .matrix-bg, .matrix-rain, .matrix-code-rain, .matrix-column { display: none !important; }
-            .cp-glitch { position: relative; display: inline-block; }
             [hidden] { display: none !important; }
 
             /* ================= Top bar ================= */
@@ -96,45 +94,6 @@
                 clip-path: none;
             }
             #languageSelector option { background: var(--sq-bg); color: var(--sq-ink); }
-            .cp-fx-toggle {
-                position: static;
-                background: transparent !important;
-                border: 0 !important;
-                border-bottom: 1px solid transparent !important;
-                border-radius: 0;
-                color: var(--sq-muted);
-                padding: 6px 1px !important;
-                font-family: inherit;
-                font-size: 11px;
-                letter-spacing: 0.1em;
-                text-transform: uppercase;
-                cursor: pointer;
-                text-shadow: none;
-                box-shadow: none !important;
-                clip-path: none;
-                display: inline-flex; align-items: center; gap: 7px;
-                white-space: nowrap;
-            }
-            .cp-fx-toggle:hover {
-                color: var(--sq-ink-strong) !important;
-                background: transparent !important;
-                border-bottom-color: var(--sq-ink) !important;
-                text-shadow: none;
-                box-shadow: none !important;
-            }
-            .cp-fx-toggle .cp-fx-dot {
-                width: 6px; height: 6px;
-                background: var(--sq-ink);
-                border-radius: 50%;
-                box-shadow: none;
-                transition: all 0.2s;
-            }
-            body.fx-off .cp-fx-toggle { color: var(--sq-muted); }
-            body.fx-off .cp-fx-toggle .cp-fx-dot {
-                background: transparent;
-                border: 1px solid var(--sq-muted);
-                box-shadow: none;
-            }
             .cp-hud {
                 position: static;
                 margin-inline-start: auto;
@@ -404,25 +363,6 @@
             .cp-toast.cp-toast-error::after { background: var(--sq-line); box-shadow: none; }
             .cp-toast.cp-toast-error .cp-toast-icon { color: var(--sq-err); text-shadow: none; }
 
-            /* FX OFF keeps working (JS toggles the class); it only strips motion. */
-            body.fx-off .matrix-bg,
-            body.fx-off .matrix-code-rain,
-            body.fx-off .matrix-column { display: none !important; }
-            body.fx-off::before,
-            body.fx-off::after { display: none !important; content: none !important; }
-            body.fx-off { background: var(--sq-bg) !important; }
-            body.fx-off * {
-                animation: none !important;
-                transition: color 0.15s, background-color 0.15s, border-color 0.15s !important;
-            }
-            body.fx-off .cp-glitch::before,
-            body.fx-off .cp-glitch::after { display: none !important; }
-            body.fx-off .terminal-cursor::after,
-            body.fx-off .cp-fab-save .cp-fab-dot { animation: none !important; }
-            body.fx-off .cp-fab-save:hover { transform: none !important; }
-            body.fx-off .cp-action-bar.cp-dirty::before { animation: none !important; }
-            body.fx-off .card { backdrop-filter: none !important; }
-            body.fx-off select, body.fx-off input, body.fx-off textarea { backdrop-filter: none !important; }
 
             /* ================= Page frame & sections ================= */
             .container {
